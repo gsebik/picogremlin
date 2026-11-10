@@ -1,0 +1,776 @@
+#!/usr/bin/env bash
+# pg — PicoGremlin build / flash / test helper.
+#
+# One entry point so no step-by-step is needed. Every path is auto-detected with
+# an environment override; nothing is hardcoded to a machine.
+#
+#   ./pg install        one-shot bootstrap: submodules + pico-sdk 2.3.1 + build
+#   ./pg doctor         check toolchain + SDK (pico_usb_reset), print a status table
+#   ./pg setup          clone pico-sdk 2.3.1 to $PICO_SDK_PATH if missing/too old
+#   ./pg build          configure + build the probe firmware -> build/picogremlin.uf2
+#   ./pg list           list attached boards (serial, mode, ports, first flashed)
+#   ./pg udev install   add friendly /dev/picogremlin-<serial>-{debugprobe,
+#                       logicanalyzer} links (status | uninstall)
+#   ./pg flash          flash the firmware (auto-picks the only board; --all
+#                       flashes every attached board; logs to logs/flash_log.csv;
+#                       registers new boards in boards.csv)
+#   ./pg selftest       flash + one-pass functional check through a wired target
+#                       fixture: USB, SWD, fixture, UART, LA (--no-flash to skip
+#                       flashing)
+#   ./pg qualify [s..]  one board: flash -> test -> target erased -> result
+#                       recorded (default: full HIL suite; --quick: ~1 min
+#                       selftest; --no-flash skips flashing)
+#   ./pg fixture        build the HIL target fixture (PICO_BOARD=pico2)
+#   ./pg fixture-flash  program the fixture onto the target via OpenOCD (SWD)
+#   ./pg test [names]   run HIL suites (default: swd uart autobaud la concurrency),
+#                       stream detailed logs to logs/ and print a summary
+#   ./pg tools install  install the host tools (la CLI + Qt GUI) from the
+#                       picogremlin-la repo (--no-gui | --dev | --ref REF |
+#                       --desktop | --uninstall are passed through)
+#   ./pg all            doctor -> build -> flash -> fixture -> fixture-flash -> test
+#
+# Environment overrides (all optional):
+#   PICO_SDK_PATH   pico-sdk checkout, >= 2.3.0      (default: ~/pico-sdk)
+#   PICOTOOL_DIR    dir with picotoolConfig.cmake    (default: newest under ~/.pico-sdk/picotool)
+#   PICOTOOL        picotool binary                  (default: from PICOTOOL_DIR or PATH)
+#   OPENOCD         openocd binary                   (default: PATH or ~/.pico-sdk/openocd/*)
+#   OPENOCD_SCRIPTS openocd scripts dir              (default: derived from OPENOCD)
+#   PICOGREMLIN_SERIAL  select a specific probe      (default: the only one attached;
+#                       used by ./pg flash and the HIL suites)
+#   BUILD_DIR       firmware build dir               (default: build)
+#   PG_WIRED        channel set for the channel suite (default: script default)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+# ---- pretty output -----------------------------------------------------------
+if [ -t 1 ]; then B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; C=$'\e[36m'; Z=$'\e[0m'
+else B=; G=; Y=; R=; C=; Z=; fi
+info() { printf '%s==>%s %s\n' "$C" "$Z" "$*"; }
+ok()   { printf '  %s✓%s %s\n' "$G" "$Z" "$*"; }
+warn() { printf '  %s!%s %s\n' "$Y" "$Z" "$*"; }
+bad()  { printf '  %s✗%s %s\n' "$R" "$Z" "$*"; }
+die()  { printf '%sError:%s %s\n' "$R" "$Z" "$*" >&2; exit 1; }
+
+# ---- config / auto-detection -------------------------------------------------
+BOARD_FW=pico2_w
+BOARD_FIXTURE=pico2
+BUILD_DIR="${BUILD_DIR:-build}"
+PICO_SDK_PATH="${PICO_SDK_PATH:-$HOME/pico-sdk}"
+FIXTURE_DIR="tests/hardware/target_fixture"
+UF2="$BUILD_DIR/picogremlin.uf2"
+FIXTURE_ELF="$FIXTURE_DIR/build/target_fixture.elf"
+
+sdk_has_usb_reset() { [ -f "$PICO_SDK_PATH/src/rp2_common/pico_usb_reset/include/pico/usb_reset.h" ]; }
+
+detect_picotool_dir() {
+  if [ -n "${PICOTOOL_DIR:-}" ]; then echo "$PICOTOOL_DIR"; return; fi
+  local best="" d
+  for d in $(ls -d "$HOME"/.pico-sdk/picotool/*/picotool 2>/dev/null | sort -V); do
+    [ -f "$d/picotoolConfig.cmake" ] && best="$d"
+  done
+  echo "$best"
+}
+detect_picotool_bin() {
+  if [ -n "${PICOTOOL:-}" ]; then echo "$PICOTOOL"; return; fi
+  local dir; dir="$(detect_picotool_dir)"
+  if [ -n "$dir" ] && [ -x "$dir/picotool" ]; then echo "$dir/picotool"; return; fi
+  command -v picotool 2>/dev/null || true
+}
+detect_openocd() {
+  if [ -n "${OPENOCD:-}" ]; then echo "$OPENOCD"; return; fi
+  command -v openocd 2>/dev/null && return
+  ls -d "$HOME"/.pico-sdk/openocd/*/openocd 2>/dev/null | sort -V | tail -1
+}
+detect_openocd_scripts() {
+  if [ -n "${OPENOCD_SCRIPTS:-}" ]; then echo "$OPENOCD_SCRIPTS"; return; fi
+  local oocd d cand; oocd="$(detect_openocd)"; [ -z "$oocd" ] && return
+  d="$(dirname "$oocd")"
+  for cand in "$d/scripts" "$d/../scripts" "$d/../share/openocd/scripts"; do
+    [ -d "$cand" ] && { (cd "$cand" && pwd); return; }
+  done
+}
+
+PICOTOOL_DIR="$(detect_picotool_dir)"
+PICOTOOL_BIN="$(detect_picotool_bin)"
+OPENOCD_BIN="$(detect_openocd)"
+OPENOCD_SCR="$(detect_openocd_scripts)"
+export PICO_SDK_PATH
+[ -n "$OPENOCD_SCR" ] && export OPENOCD_SCRIPTS="$OPENOCD_SCR"
+[ -n "$OPENOCD_BIN" ] && export OPENOCD="$OPENOCD_BIN"
+
+cmake_common=(-DPICO_SDK_PATH="$PICO_SDK_PATH")
+[ -n "$PICOTOOL_DIR" ] && cmake_common+=(-Dpicotool_DIR="$PICOTOOL_DIR")
+
+# ---- fix hints ---------------------------------------------------------------
+hint() { printf '      %s↳ %s%s\n' "$C" "$*" "$Z"; }
+
+detect_pm() {
+  local pm
+  for pm in pacman apt-get dnf zypper brew; do command -v "$pm" >/dev/null 2>&1 && { echo "$pm"; return; }; done
+}
+PM="$(detect_pm)"
+
+# install_hint "<pacman>" "<apt>" "<dnf>" "<brew>" — print the fix line for this host's PM
+install_hint() {
+  case "$PM" in
+    pacman) hint "install: sudo pacman -S $1" ;;
+    apt-get) hint "install: sudo apt install $2" ;;
+    dnf)    hint "install: sudo dnf install $3" ;;
+    zypper) hint "install: sudo zypper install $3" ;;
+    brew)   hint "install: brew install $4" ;;
+    *)      hint "install one of: $1 (pacman) / $2 (apt) / $3 (dnf) / $4 (brew)" ;;
+  esac
+}
+
+# ---- board discovery / registry ----------------------------------------------
+BOARDS_CSV="$ROOT/boards.csv"
+FLASH_LOG="$ROOT/logs/flash_log.csv"
+UDEV_RULES="$ROOT/udev/99-picogremlin.rules"
+UDEV_DEST=/etc/udev/rules.d/99-picogremlin.rules
+PICOGREMLIN_VID=2e8a
+
+# Attached boards, one line each: serial|pid|product|mode
+# mode: app (2e8a:0009) or BOOTSEL (2e8a:000f). Reads Linux sysfs; empty elsewhere.
+# The RP2350 reports the OTP chip ID as its USB serial in both modes, so the
+# same 16-hex value identifies a board before and after flashing.
+pg_boards() {
+  local d v p s ser
+  [ -d /sys/bus/usb/devices ] || return 0
+  for d in /sys/bus/usb/devices/*/; do
+    case "${d##*/}" in *:*) continue ;; esac        # skip interface dirs
+    v=$(cat "$d/idVendor" 2>/dev/null) || continue
+    [ "$v" = "$PICOGREMLIN_VID" ] || continue
+    p=$(cat "$d/idProduct" 2>/dev/null) || continue
+    case "$p" in
+      0009) s=app ;;
+      000f) s=BOOTSEL ;;
+      *)    continue ;;
+    esac
+    ser=$(cat "$d/serial" 2>/dev/null) || continue
+    [ -n "$ser" ] || continue
+    printf '%s|%s|%s|%s\n' "$ser" "$p" "$(cat "$d/product" 2>/dev/null)" "$s"
+  done | sort -u
+}
+
+# CDC ports for a serial, preferring the installed udev links:
+# "/dev/picogremlin-<serial>-debugprobe -> ttyACM2  " or "/dev/ttyACM1 (if00) ".
+# if01/if03 are the PicoGremlin interface layout; anything else prints as ifNN.
+pg_ports_for() {
+  local s="$1" l tgt friendly n
+  for l in /dev/serial/by-id/*; do
+    [ -e "$l" ] || continue
+    case "${l##*/}" in *"$s"*) ;; *) continue ;; esac
+    tgt=$(readlink -f "$l" 2>/dev/null) || continue
+    n="${l##*-if}"
+    case "$n" in
+      01) friendly="/dev/picogremlin-$s-debugprobe" ;;
+      03) friendly="/dev/picogremlin-$s-logicanalyzer" ;;
+      *)  friendly="" ;;
+    esac
+    if [ -n "$friendly" ] && [ -e "$friendly" ]; then
+      printf '%s -> %s  ' "$friendly" "${tgt##*/}"
+    else
+      case "$n" in
+        01) n=UART ;;
+        03) n=LA ;;
+        *)  n="if$n" ;;
+      esac
+      printf '/dev/%s (%s) ' "${tgt##*/}" "$n"
+    fi
+  done
+}
+
+# first_seen timestamp from boards.csv, empty when the board is not registered
+pg_board_first_seen() {
+  [ -f "$BOARDS_CSV" ] || return 0
+  awk -F, -v s="$1" 'toupper($1) == toupper(s) { print $2; exit }' "$BOARDS_CSV"
+}
+
+# label from boards.csv (column 3), empty when unset
+pg_board_label() {
+  [ -f "$BOARDS_CSV" ] || return 0
+  awk -F, -v s="$1" 'toupper($1) == toupper(s) { print $3; exit }' "$BOARDS_CSV"
+}
+
+# render a pg_boards listing
+pg_print_boards() {
+  printf '  %-16s %-8s %-12s %-12s %s\n' "SERIAL" "MODE" "FIRST SEEN" "LABEL" "PORTS"
+  local ser pid prod mode first label ports
+  while IFS='|' read -r ser pid prod mode; do
+    first=$(pg_board_first_seen "$ser"); [ -n "$first" ] || first="-"
+    label=$(pg_board_label "$ser"); [ -n "$label" ] || label="-"
+    ports=$(pg_ports_for "$ser"); [ -n "$ports" ] || ports="-"
+    printf '  %-16s %-8s %-12s %-12s %s\n' "$ser" "$mode" "${first:0:10}" "$label" "$ports"
+  done <<< "$1"
+}
+
+# register a board in boards.csv (append-only); prints NEW/known
+pg_register_board() {
+  local ser="$1"
+  if [ -z "$(pg_board_first_seen "$ser")" ]; then
+    [ -f "$BOARDS_CSV" ] || echo "chip_id,first_seen,label,notes" > "$BOARDS_CSV"
+    echo "$ser,$(date +%Y-%m-%dT%H:%M:%S%z),," >> "$BOARDS_CSV"
+    ok "NEW board $ser registered in boards.csv"
+  else
+    ok "known board $ser (first flashed $(pg_board_first_seen "$ser"))"
+  fi
+}
+
+# append one attempt to logs/flash_log.csv; register newly flashed boards
+pg_log_flash() {  # $1 serial, $2 result (ok|no-boot|fail), $3 mode before flash
+  local ser="$1" result="$2" mode="$3"
+  local stamp descr fwver sha
+  stamp="$(date +%Y-%m-%dT%H:%M:%S%z)"
+  descr="$(git -C "$ROOT" describe --always --dirty 2>/dev/null || echo unknown)"
+  fwver="$(sed -n 's/^#define PROBE_VERSION "\(.*\)"/\1/p' "$ROOT/picogremlin/firmware/probe/version.h" | head -1)"
+  if command -v sha256sum >/dev/null; then sha="$(sha256sum "$UF2")"; sha="${sha%% *}"
+  elif command -v shasum >/dev/null; then sha="$(shasum -a 256 "$UF2")"; sha="${sha%% *}"
+  else sha="unknown"; fi
+  mkdir -p "$ROOT/logs"
+  [ -f "$FLASH_LOG" ] || echo "timestamp,chip_id,result,mode_before,fw_version,git,uf2_sha256,host,user" > "$FLASH_LOG"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$stamp" "$ser" "$result" "$mode" "${fwver:-unknown}" "$descr" "$sha" "$(hostname)" "${USER:-}" >> "$FLASH_LOG"
+
+  case "$result" in
+    ok)
+      pg_register_board "$ser"
+      ok "logged to logs/flash_log.csv"
+      ;;
+  esac
+}
+
+# ---- commands ----------------------------------------------------------------
+cmd_doctor() {
+  local fail=0
+  info "Toolchain"
+  command -v cmake            >/dev/null && ok "cmake ($(command -v cmake))"            || { bad "cmake missing";            install_hint cmake cmake cmake cmake; fail=1; }
+  command -v arm-none-eabi-gcc >/dev/null && ok "arm-none-eabi-gcc"                     || { bad "arm-none-eabi-gcc missing"; install_hint arm-none-eabi-gcc gcc-arm-none-eabi arm-none-eabi-gcc-cs arm-none-eabi-gcc; fail=1; }
+  command -v python3          >/dev/null && ok "python3 ($(command -v python3))"        || { bad "python3 missing";          install_hint python python3 python3 python; fail=1; }
+  command -v git              >/dev/null && ok "git"                                    || { bad "git missing";              install_hint git git git git; fail=1; }
+  command -v ninja            >/dev/null && ok "ninja"                                  || { warn "ninja not found (make will be used)"; install_hint ninja ninja-build ninja-build ninja; }
+
+  info "Pico SDK  ($PICO_SDK_PATH)"
+  if [ ! -d "$PICO_SDK_PATH" ]; then
+    bad "not a directory"; hint "run: ./pg setup   (clones pico-sdk 2.3.1 to \$PICO_SDK_PATH)"; fail=1
+  elif sdk_has_usb_reset; then ok "has pico_usb_reset (pico/usb_reset.h) — SDK >= 2.3.0"
+  else
+    bad "no pico_usb_reset library — SDK is too old (need >= 2.3.0)"
+    hint "run: ./pg setup   — or point PICO_SDK_PATH at an SDK >= 2.3.0"; fail=1
+  fi
+
+  info "picotool (>= 2.3.0 for SDK 2.3.1)"
+  if [ -n "$PICOTOOL_BIN" ]; then ok "$PICOTOOL_BIN ($($PICOTOOL_BIN version 2>/dev/null | head -1))"
+  else
+    bad "picotool not found"
+    install_hint picotool picotool picotool picotool
+    hint "or install the pico VS Code extension (ships picotool under ~/.pico-sdk/picotool/), or set \$PICOTOOL"; fail=1
+  fi
+  if [ -n "$PICOTOOL_DIR" ]; then ok "cmake picotool_DIR = $PICOTOOL_DIR"
+  else warn "no picotoolConfig.cmake found — cmake will try to fetch picotool itself"; hint "set PICOTOOL_DIR=<dir containing picotoolConfig.cmake> to avoid the fetch"; fi
+
+  info "OpenOCD (for target flashing / SWD tests)"
+  if [ -n "$OPENOCD_BIN" ]; then ok "$OPENOCD_BIN"
+  else warn "openocd not found (flash/test SWD will fail)"; install_hint openocd openocd openocd open-ocd; hint "or set \$OPENOCD to a Raspberry Pi OpenOCD build with target/rp2350.cfg"; fi
+  if [ -n "$OPENOCD_SCR" ]; then ok "scripts = $OPENOCD_SCR"
+  else warn "OPENOCD_SCRIPTS not resolved (relying on openocd's built-in search path)"; hint "set \$OPENOCD_SCRIPTS to the openocd scripts dir if target/rp2350.cfg is not found"; fi
+
+  info "Python HIL deps"
+  if python3 -c "import serial" 2>/dev/null; then ok "pyserial"
+  else warn "pyserial missing (optional; only some suites need it)"; install_hint python-pyserial python3-serial python3-pyserial pyserial; hint "or: python3 -m pip install pyserial"; fi
+  if command -v gdb-multiarch >/dev/null || command -v arm-none-eabi-gdb >/dev/null; then ok "gdb ($(command -v gdb-multiarch arm-none-eabi-gdb | head -1))"
+  else warn "no gdb-multiarch / arm-none-eabi-gdb (only the tests_swd GDB step needs it)"; install_hint arm-none-eabi-gdb gdb-multiarch gdb arm-none-eabi-gdb; hint "or set \$GDB to your cross-gdb binary"; fi
+
+  info "Host tools (la CLI / la gui)"
+  local la_bin="$HOME/.local/share/picogremlin/venv/bin/la"
+  if [ -x "$la_bin" ]; then
+    ok "la in the shared venv ($la_bin)"
+  elif command -v la >/dev/null 2>&1; then
+    ok "la on PATH ($(command -v la))"
+  else
+    warn "host tools not installed — they live in the picogremlin-la repo now"
+    hint "pipx install 'picogremlin-la[gui]'   (or pip install -e ../picogremlin-la[gui])"
+  fi
+
+  info "Hardware"
+  local boards_rows; boards_rows="$(pg_boards)"
+  if [ -n "$boards_rows" ]; then
+    ok "$(printf '%s\n' "$boards_rows" | wc -l) board(s) attached"
+    pg_print_boards "$boards_rows"
+  else
+    warn "no board found (2e8a:0009 app / 2e8a:000f BOOTSEL)"
+    hint "plug it in; a blank board shows up in BOOTSEL — ./pg flash loads the firmware"
+  fi
+  if command -v udevadm >/dev/null; then
+    if [ -f "$UDEV_DEST" ]; then ok "friendly port names installed (/dev/picogremlin-<serial>-…)"
+    else hint "friendly port names not installed: ./pg udev install"; fi
+  fi
+
+  echo
+  [ "$fail" -eq 0 ] && { info "${B}doctor: OK${Z}"; } || die "doctor found blocking issues (see ✗ above)"
+}
+
+cmd_setup() {
+  if sdk_has_usb_reset; then info "SDK at $PICO_SDK_PATH already has pico_usb_reset — nothing to do"; return; fi
+  [ -e "$PICO_SDK_PATH" ] && die "$PICO_SDK_PATH exists but lacks pico_usb_reset; move it aside or set PICO_SDK_PATH elsewhere"
+  info "Cloning pico-sdk 2.3.1 -> $PICO_SDK_PATH (large, with submodules)"
+  git clone --recurse-submodules --depth 1 --branch 2.3.1 https://github.com/raspberrypi/pico-sdk.git "$PICO_SDK_PATH"
+  sdk_has_usb_reset && ok "pico_usb_reset present" || die "clone finished but pico_usb_reset still missing"
+  info "Set this for future shells:  export PICO_SDK_PATH=$PICO_SDK_PATH"
+}
+
+require_sdk() { sdk_has_usb_reset || die "PICO_SDK_PATH=$PICO_SDK_PATH lacks pico_usb_reset (need pico-sdk >= 2.3.0). Run ./pg setup or ./pg doctor."; }
+
+use_sdk_path() {  # re-point PICO_SDK_PATH (and cmake args) to $1
+  PICO_SDK_PATH="$1"; export PICO_SDK_PATH
+  cmake_common=(-DPICO_SDK_PATH="$PICO_SDK_PATH")
+  [ -n "$PICOTOOL_DIR" ] && cmake_common+=(-Dpicotool_DIR="$PICOTOOL_DIR")
+}
+
+cmd_install() {
+  info "${B}[1/4] Submodules${Z}"
+  git submodule update --init --recursive
+  ok "submodules initialized"
+
+  info "${B}[2/4] Pico SDK (2.3.1)${Z}"
+  if sdk_has_usb_reset; then ok "usable SDK at $PICO_SDK_PATH"
+  else
+    if [ "$PICO_SDK_PATH" != "$HOME/pico-sdk" ]; then
+      warn "PICO_SDK_PATH=$PICO_SDK_PATH is older than 2.3.0; bootstrapping $HOME/pico-sdk instead"
+      use_sdk_path "$HOME/pico-sdk"
+    fi
+    cmd_setup
+  fi
+
+  info "${B}[3/4] Environment check${Z}"
+  cmd_doctor   # dies with fix hints if a required tool is still missing
+
+  info "${B}[4/4] Build firmware${Z}"
+  cmd_build
+
+  echo
+  info "${B}${G}install complete${Z} -> $UF2"
+  hint "persist the SDK path:  echo 'export PICO_SDK_PATH=$PICO_SDK_PATH' >> ~/.bashrc"
+  hint "flash the probe:       ./pg flash"
+  hint "run HIL tests:         ./pg fixture && ./pg fixture-flash && ./pg test"
+}
+
+cmd_build() {
+  require_sdk
+  info "Configuring firmware ($BOARD_FW)"
+  cmake -B "$BUILD_DIR" -S picogremlin/firmware "${cmake_common[@]}" -DPICO_BOARD="$BOARD_FW"
+  info "Building"
+  cmake --build "$BUILD_DIR" -j"$(nproc)"
+  [ -f "$UF2" ] && ok "built $UF2 ($(stat -c%s "$UF2") bytes)" || die "build produced no $UF2"
+}
+
+cmd_list() {
+  local rows; rows="$(pg_boards)"
+  if [ -z "$rows" ]; then
+    warn "no boards found (2e8a:0009 app / 2e8a:000f BOOTSEL)"
+    hint "plug a board in; a blank board shows up in BOOTSEL only"
+    return 0
+  fi
+  info "${B}Boards${Z}"
+  pg_print_boards "$rows"
+  [ "$(printf '%s\n' "$rows" | wc -l)" -gt 1 ] && \
+    hint "select one for flash/tests with PICOGREMLIN_SERIAL=<serial>"
+  true
+}
+
+cmd_udev() {
+  local sub="${1:-status}"
+  case "$sub" in
+    status)
+      if [ -f "$UDEV_DEST" ]; then
+        if cmp -s "$UDEV_RULES" "$UDEV_DEST"; then ok "$UDEV_DEST (up to date)"
+        else warn "$UDEV_DEST differs from $UDEV_RULES — rerun: ./pg udev install"; fi
+      else
+        warn "not installed ($UDEV_DEST)"
+        hint "install with: ./pg udev install   (needs sudo)"
+      fi
+      local l any=0
+      for l in /dev/picogremlin-*; do
+        [ -e "$l" ] || continue
+        printf '  %s -> %s\n' "$l" "$(readlink "$l")"
+        any=1
+      done
+      [ "$any" = 1 ] || hint "no /dev/picogremlin-* links present"
+      ;;
+    install)
+      [ -f "$UDEV_RULES" ] || die "$UDEV_RULES not found"
+      command -v udevadm >/dev/null || die "udevadm not found — friendly names are a udev/systemd feature"
+      info "Installing $(basename "$UDEV_RULES") -> $UDEV_DEST"
+      sudo install -m644 "$UDEV_RULES" "$UDEV_DEST"
+      sudo udevadm control --reload-rules
+      sudo udevadm trigger --subsystem-match=tty --action=add
+      sleep 1
+      cmd_udev status
+      ;;
+    uninstall)
+      sudo rm -f "$UDEV_DEST"
+      sudo udevadm control --reload-rules
+      sudo udevadm trigger --subsystem-match=tty --action=add
+      ok "removed $UDEV_DEST"
+      ;;
+    *) die "unknown udev subcommand '$sub' (status | install | uninstall)" ;;
+  esac
+}
+
+# pick the board to operate on: sets PG_SER / PG_MODE. Dies (with the board
+# table) when nothing is attached, PICOGREMLIN_SERIAL is wrong, or the choice
+# is ambiguous.
+pg_pick_board() {
+  local rows; rows="$(pg_boards)"
+  [ -n "$rows" ] || die "no board found (2e8a:0009 app / 2e8a:000f BOOTSEL) — plug the probe in (hold BOOTSEL on a blank board)"
+  local ser="${PICOGREMLIN_SERIAL:-}" row
+  if [ -n "$ser" ]; then
+    ser="${ser^^}"
+    row="$(printf '%s\n' "$rows" | grep -m1 -F "$ser|")" || {
+      pg_print_boards "$rows"
+      die "PICOGREMLIN_SERIAL=$ser is not attached"
+    }
+  else
+    if [ "$(printf '%s\n' "$rows" | wc -l)" -gt 1 ]; then
+      pg_print_boards "$rows"
+      die "multiple boards attached — select one with PICOGREMLIN_SERIAL=<serial> (./pg list)"
+    fi
+    row="$rows"
+    ser="$(printf '%s\n' "$row" | cut -d'|' -f1)"
+  fi
+  PG_SER="$ser"
+  PG_MODE="$(printf '%s\n' "$row" | cut -d'|' -f4)"
+}
+
+# flash one already-selected board: $1 serial, $2 mode (app|BOOTSEL)
+pg_flash_one() {
+  local ser="$1" mode="$2" i result=ok
+  local args=("$PICOTOOL_BIN" load -u -v -x --ser "$ser" "$UF2")
+
+  if [ "$mode" = app ]; then
+    info "Rebooting ${B}$ser${Z} into BOOTSEL (runtime reset)"
+    if "$PICOTOOL_BIN" reboot -u -f --ser "$ser"; then
+      for i in $(seq 1 20); do
+        pg_boards | grep -qF "$ser|000f" && break
+        sleep 0.5
+      done
+    fi
+    if ! pg_boards | grep -qF "$ser|000f"; then
+      bad "board $ser did not enter BOOTSEL"
+      pg_log_flash "$ser" fail "$mode"
+      hint "hold BOOTSEL while plugging the board in, then rerun ./pg flash"
+      return 1
+    fi
+  fi
+
+  info "Flashing ${B}$ser${Z} ($mode) with $UF2"
+  if "${args[@]}"; then
+    for i in $(seq 1 20); do
+      pg_boards | grep -qF "$ser|0009" && break
+      sleep 0.5
+    done
+    pg_boards | grep -qF "$ser|0009" || result=no-boot
+  else
+    result=fail
+  fi
+  pg_log_flash "$ser" "$result" "$mode"
+
+  case "$result" in
+    ok)      ok "board $ser flashed and running"; return 0 ;;
+    no-boot) bad "flashed, but $ser did not re-appear as an app device — firmware may crash early"
+             return 1 ;;
+    fail)    bad "flash failed for $ser (see picotool output above)"; return 1 ;;
+  esac
+}
+
+cmd_flash() {
+  [ -f "$UF2" ] || die "$UF2 not found — run ./pg build first"
+  [ -n "$PICOTOOL_BIN" ] || die "picotool not found"
+
+  if [ "${1:-}" = "--all" ]; then
+    local rows; rows="$(pg_boards)"
+    [ -n "$rows" ] || die "no boards attached (2e8a:0009 app / 2e8a:000f BOOTSEL)"
+    local ser pid prod mode n=0 failed=0
+    while IFS='|' read -r ser pid prod mode; do
+      n=$((n + 1))
+      pg_flash_one "$ser" "$mode" || failed=$((failed + 1))
+    done <<< "$rows"
+    [ "$failed" -eq 0 ] || die "$failed of $n board(s) failed to flash"
+    ok "$n board(s) flashed"
+    return 0
+  fi
+
+  if [ ! -d /sys/bus/usb/devices ]; then
+    warn "no sysfs USB enumeration on this host — serial selection and the flash log need Linux"
+    hint "falling back to: picotool load -u -v -x $UF2"
+    "$PICOTOOL_BIN" load -u -v -x "$UF2" || die "picotool load failed"
+    ok "flashed"
+    return 0
+  fi
+
+  pg_pick_board
+  pg_flash_one "$PG_SER" "$PG_MODE"
+}
+
+# quick SWD reachability check through the selected probe
+# (needs PICOGREMLIN_SERIAL exported for adapter selection)
+pg_swd_ready() {
+  [ -n "$OPENOCD_BIN" ] || return 1
+  local args=("$OPENOCD_BIN")
+  [ -n "$OPENOCD_SCR" ] && args+=(-s "$OPENOCD_SCR")
+  args+=(-f tests/hardware/pg_target_single.cfg -c "init" -c "reset halt" -c "shutdown")
+  "${args[@]}" >/dev/null 2>&1
+}
+
+# refuse to run while another OpenOCD server holds the probe
+pg_require_no_openocd() {
+  if pgrep -x openocd >/dev/null 2>&1 && ps -o stat= -C openocd 2>/dev/null | grep -qv '^Z'; then
+    pgrep -a -x openocd | sed 's/^/      /'
+    if pgrep -f "picolab ocd" >/dev/null 2>&1; then
+      hint "your picolab ocd session restarts OpenOCD — Ctrl-C in that terminal first"
+    fi
+    die "an OpenOCD server is holding the probe — stop it first (Ctrl-C in its terminal, or pkill -x openocd)"
+  fi
+}
+
+cmd_selftest() {
+  local do_flash=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-flash) do_flash=0 ;;
+      *) die "unknown ./pg selftest option '$1' (only --no-flash)" ;;
+    esac
+    shift
+  done
+
+  [ -d /sys/bus/usb/devices ] || die "selftest needs Linux (sysfs USB enumeration)"
+
+  pg_require_no_openocd
+
+  local elf="tests/hardware/target_fixture/build/target_fixture.elf"
+  if [ ! -f "$elf" ]; then
+    info "target fixture not built — building it first"
+    cmd_fixture
+  fi
+
+  if [ "$do_flash" = 1 ]; then
+    [ -f "$UF2" ] || die "$UF2 not found — run ./pg build first"
+    [ -n "$PICOTOOL_BIN" ] || die "picotool not found"
+    pg_pick_board
+    pg_flash_one "$PG_SER" "$PG_MODE" || die "selftest aborted: flash failed"
+  else
+    pg_pick_board
+  fi
+
+  info "${B}Self-test${Z} $PG_SER — USB · SWD · fixture · UART · LA"
+  mkdir -p logs
+  local log="logs/selftest.log" rc=0
+  set +e
+  PICOGREMLIN_SERIAL="$PG_SER" python3 tests/hardware/tests_selftest.py \
+    --out tests/hardware/artifacts/selftest 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+  set -e
+  local summary; summary="$(grep -E "SUMMARY:" "$log" | tail -1 || true)"
+  [ "$rc" -eq 0 ] || die "selftest: ${summary:-failed} (see $log)"
+  info "${B}${G}selftest: all checks PASS${Z}  $summary"
+}
+
+cmd_qualify() {
+  local do_flash=1 quick=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-flash) do_flash=0; shift ;;
+      --quick) quick=1; shift ;;
+      -*) die "unknown ./pg qualify option '$1' (only --no-flash, --quick)" ;;
+      *) break ;;
+    esac
+  done
+  local suites=("$@")
+  [ ${#suites[@]} -gt 0 ] || suites=(all)
+
+  [ -d /sys/bus/usb/devices ] || die "qualify needs Linux (sysfs USB enumeration)"
+  pg_require_no_openocd
+
+  local elf="tests/hardware/target_fixture/build/target_fixture.elf"
+  [ -f "$elf" ] || { info "target fixture not built — building it first"; cmd_fixture; }
+
+  pg_pick_board
+  if [ "$do_flash" = 1 ]; then
+    [ -f "$UF2" ] || die "$UF2 not found — run ./pg build first"
+    [ -n "$PICOTOOL_BIN" ] || die "picotool not found"
+    pg_flash_one "$PG_SER" "$PG_MODE" || die "qualify aborted: flash failed"
+  else
+    pg_register_board "$PG_SER"
+  fi
+
+  export PICOGREMLIN_SERIAL="$PG_SER"
+  info "Jig check: SWD through $PG_SER"
+  if pg_swd_ready; then ok "target fixture answers over SWD"
+  else
+    die "target fixture does not answer over SWD — check its power/wiring, then rerun: ./pg qualify --no-flash"
+  fi
+
+  local qlog="logs/qualify-$PG_SER.log" rc=0
+  mkdir -p logs
+  if [ "$quick" = 1 ]; then
+    info "${B}Qualifying${Z} $PG_SER — quick selftest"
+    set +e
+    python3 tests/hardware/tests_selftest.py --out tests/hardware/artifacts/selftest 2>&1 | tee "$qlog"
+    rc=${PIPESTATUS[0]}
+    set -e
+    suites=(selftest)
+  else
+    info "${B}Qualifying${Z} $PG_SER — HIL suites: ${suites[*]}"
+    set +e
+    cmd_test "${suites[@]}" 2>&1 | tee "$qlog"
+    rc=${PIPESTATUS[0]}
+    set -e
+  fi
+
+  info "Clearing the target (erasing target flash)"
+  local cleared=1
+  if pg_clear_target; then ok "target cleared — flash erased, left running blank"
+  else
+    cleared=0
+    warn "could not clear the target flash"
+    hint "if a picolab ocd / OpenOCD server is running, stop it (it holds the probe)"
+  fi
+
+  local result=PASS; [ "$rc" -eq 0 ] || result=FAIL
+  local fwver qcsv="logs/qualify_log.csv"
+  fwver="$(sed -n 's/^#define PROBE_VERSION "\(.*\)"/\1/p' "$ROOT/picogremlin/firmware/probe/version.h" | head -1)"
+  [ -f "$qcsv" ] || echo "timestamp,chip_id,result,suites,fw_version,git,host,user,log" > "$qcsv"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$(date +%Y-%m-%dT%H:%M:%S%z)" "$PG_SER" "$result" "${suites[*]}" "${fwver:-unknown}" \
+    "$(git -C "$ROOT" describe --always --dirty 2>/dev/null || echo unknown)" \
+    "$(hostname)" "${USER:-}" "$qlog" >> "$qcsv"
+
+  if [ "$result" = PASS ]; then
+    if [ "$cleared" = 1 ]; then
+      info "${B}${G}qualified${Z} $PG_SER: test PASS — target cleared, probe running $UF2"
+    else
+      info "${B}${G}qualified${Z} $PG_SER: test PASS — target NOT cleared (see warning), probe running $UF2"
+    fi
+  else
+    die "qualify FAIL for $PG_SER — see $qlog (result recorded, target cleared: $([ "$cleared" = 1 ] && echo yes || echo no))"
+  fi
+}
+
+# erase the target's flash and leave it running blank (jig cleanup);
+# retries once — a restarted OpenOCD server can steal the probe mid-run
+pg_clear_target() {
+  [ -n "$OPENOCD_BIN" ] || { warn "openocd not found — cannot clear the target"; return 1; }
+  local args=("$OPENOCD_BIN") out attempt
+  [ -n "$OPENOCD_SCR" ] && args+=(-s "$OPENOCD_SCR")
+  args+=(-f tests/hardware/pg_target_single.cfg
+         -c "init" -c "reset halt"
+         -c "flash erase_address 0x10000000 0x00400000"
+         -c "reset halt" -c "mdw 0x10000000 4" -c "reset run" -c "shutdown")
+  for attempt in 1 2; do
+    if out="$("${args[@]}" 2>&1)"; then
+      if printf '%s' "$out" | grep -q "ffffffff ffffffff"; then return 0; fi
+    fi
+    sleep 1
+  done
+  printf '%s\n' "$out" | tail -3 | sed 's/^/      /' >&2
+  return 1
+}
+
+cmd_fixture() {
+  require_sdk
+  info "Configuring target fixture ($BOARD_FIXTURE)"
+  cmake -B "$FIXTURE_DIR/build" -S "$FIXTURE_DIR" "${cmake_common[@]}" -DPICO_BOARD="$BOARD_FIXTURE"
+  info "Building fixture"
+  cmake --build "$FIXTURE_DIR/build" -j"$(nproc)"
+  [ -f "$FIXTURE_ELF" ] && ok "built $FIXTURE_ELF" || die "fixture build produced no ELF"
+}
+
+cmd_fixture_flash() {
+  [ -f "$FIXTURE_ELF" ] || die "$FIXTURE_ELF not found — run ./pg fixture first"
+  [ -n "$OPENOCD_BIN" ] || die "openocd not found (set \$OPENOCD)"
+  info "Programming fixture onto target via SWD @100 kHz"
+  local args=("$OPENOCD_BIN")
+  [ -n "$OPENOCD_SCR" ] && args+=(-s "$OPENOCD_SCR")
+  args+=(-f tests/hardware/pg_target_single.cfg -c "adapter speed 100"
+         -c "program $FIXTURE_ELF verify reset" -c "shutdown")
+  "${args[@]}"
+  ok "fixture programmed and target reset"
+}
+
+cmd_test() {
+  local -A SUITES=(
+    [swd]=tests_swd.py [uart]=tests_uart.py [autobaud]=tests_autobaud.py
+    [concurrency]=tests_concurrency.py [la]=tests_la.py [measure]=tests_measure.py
+    [range]=tests_range.py [channels]=tests_la_channels.py [stream]=tests_la_stream.py
+    [continuous]=tests_la_continuous.py [bridge]=tests_bridge_gate.py
+    [edge]=tests_la_edge.py [compat]=tests_compat.py [analog]=tests_la_analog.py
+  )
+  local names=("$@")
+  [ ${#names[@]} -eq 0 ] && names=(swd uart autobaud la concurrency)
+  [ "${names[0]:-}" = all ] && names=(swd uart autobaud la concurrency measure range channels stream continuous bridge edge compat analog)
+  mkdir -p logs
+  local name file log rc summary total_fail=0
+  for name in "${names[@]}"; do
+    file="${SUITES[$name]:-}"
+    [ -n "$file" ] || { warn "unknown suite '$name' (have: ${!SUITES[*]})"; continue; }
+    log="logs/$name.log"
+    info "${B}Suite: $name${Z}  (tests/hardware/$file)  -> $log"
+    local args=(python3 "tests/hardware/$file" --out "tests/hardware/artifacts/$name")
+    [ "$name" = channels ] && [ -n "${PG_WIRED:-}" ] && args+=(--wired "$PG_WIRED" --wired-dyn "$PG_WIRED")
+    set +e
+    "${args[@]}" 2>&1 | tee "$log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    summary="$(grep -E "SUMMARY:" "$log" | tail -1 || true)"
+    if grep -qE "^\[FAIL\]|\bFAIL\b" "$log"; then bad "$name: ${summary:-exit $rc} (see $log)"; total_fail=$((total_fail+1))
+    else ok "$name: ${summary:-done}"; fi
+  done
+  echo
+  if [ "$total_fail" -eq 0 ]; then info "${B}${G}test: all suites clean${Z}"
+  else bad "test: $total_fail suite(s) reported FAIL — inspect logs/"; return 1; fi
+}
+
+cmd_tools() {
+  # Install/upgrade the host tools (la CLI + Qt GUI) from the picogremlin-la repo.
+  local sub="${1:-install}"; shift || true
+  case "$sub" in
+    install|upgrade)
+      local sibling="$ROOT/../picogremlin-la/install.sh"
+      if [ -x "$sibling" ]; then
+        info "using the sibling checkout: $sibling"
+        "$sibling" "$@"
+      else
+        local url="https://raw.githubusercontent.com/gsebik/picogremlin-la/main/install.sh"
+        info "installing the host tools from $url"
+        curl -fsSL "$url" | bash -s -- "$@"
+      fi
+      ;;
+    *) die "usage: ./pg tools install [--no-gui|--dev|--ref REF|--desktop|--uninstall]" ;;
+  esac
+}
+
+cmd_all() { cmd_doctor; cmd_build; cmd_flash; cmd_fixture; cmd_fixture_flash; cmd_test; }
+
+cmd_help() { awk 'NR>1 && /^#/{sub(/^# ?/,"");print;next} NR>1{exit}' "${BASH_SOURCE[0]}"; }
+
+# ---- dispatch ----------------------------------------------------------------
+sub="${1:-help}"; shift || true
+case "$sub" in
+  install)        cmd_install "$@" ;;
+  doctor)         cmd_doctor "$@" ;;
+  setup)          cmd_setup "$@" ;;
+  build)          cmd_build "$@" ;;
+  list)           cmd_list "$@" ;;
+  udev)           cmd_udev "$@" ;;
+  flash)          cmd_flash "$@" ;;
+  selftest)       cmd_selftest "$@" ;;
+  qualify)        cmd_qualify "$@" ;;
+  fixture)        cmd_fixture "$@" ;;
+  fixture-flash)  cmd_fixture_flash "$@" ;;
+  test)           cmd_test "$@" ;;
+  tools)          cmd_tools "$@" ;;
+  all)            cmd_all "$@" ;;
+  help|-h|--help) cmd_help ;;
+  *) die "unknown command '$sub' (try: ./pg help)" ;;
+esac

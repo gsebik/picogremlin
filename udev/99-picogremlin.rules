@@ -1,0 +1,35 @@
+# PicoGremlin — friendly per-port names for the two CDC interfaces.
+#
+# The kernel's /dev/serial/by-id links are named after the whole device
+# (usb-PicoGremlin_..._<SERIAL>-ifNN), so both CDC ports share the same long
+# prefix. These rules add one readable, per-board link per function:
+#
+#   /dev/picogremlin-<SERIAL>-debugprobe      target UART bridge (CDC 0, if01)
+#   /dev/picogremlin-<SERIAL>-logicanalyzer   logic analyzer    (CDC 1, if03)
+#
+# <SERIAL> is the RP2350 OTP chip ID — identical in BOOTSEL and application
+# mode, so the links are stable across reflashes.
+#
+# Install:  sudo install -m644 udev/99-picogremlin.rules /etc/udev/rules.d/
+#           sudo udevadm control --reload-rules
+#           sudo udevadm trigger --subsystem-match=tty --action=add
+# or:       ./pg udev install          (also: ./pg udev status | uninstall)
+
+# Target UART bridge — CDC instance 0
+# The product string is matched with a glob ("*LogicAnalyzer*") so the rule
+# keeps working across firmware string revisions (current builds and boards
+# flashed with earlier string variants that have not been reflashed yet).
+# VID:PID alone is not enough: 2e8a:0009 is the shared "Pico SDK CDC UART"
+# PID (raspberrypi/usb-pid).
+SUBSYSTEM=="tty", KERNEL=="ttyACM[0-9]*", SUBSYSTEMS=="usb", \
+  ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="0009", \
+  ATTRS{product}=="*LogicAnalyzer*", \
+  ENV{ID_USB_INTERFACE_NUM}=="01", \
+  SYMLINK+="picogremlin-$env{ID_SERIAL_SHORT}-debugprobe"
+
+# Logic analyzer — CDC instance 1
+SUBSYSTEM=="tty", KERNEL=="ttyACM[0-9]*", SUBSYSTEMS=="usb", \
+  ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="0009", \
+  ATTRS{product}=="*LogicAnalyzer*", \
+  ENV{ID_USB_INTERFACE_NUM}=="03", \
+  SYMLINK+="picogremlin-$env{ID_SERIAL_SHORT}-logicanalyzer"

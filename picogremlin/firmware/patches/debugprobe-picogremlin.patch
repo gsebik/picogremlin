@@ -1,0 +1,79 @@
+--- a/src/probe.c
++++ b/src/probe.c
+@@ -55,0 +56,5 @@
++    // PIO state machine, claimed dynamically in probe_init() via
++    // pio_claim_unused_sm() and released in probe_deinit(). Not a fixed index —
++    // the merged build (PicoGremlin) shares PROBE_PIO with other claimants, so a
++    // hardcoded SM number is unsafe.
++    uint sm;
+@@ -71 +76 @@
+-        pio_sm_set_clkdiv_int_frac(pio0, PROBE_SM, divider, 0);
++        pio_sm_set_clkdiv_int_frac(PROBE_PIO, probe.sm, divider, 0);
+@@ -109,2 +114,2 @@
+-    pio_sm_put_blocking(pio0, PROBE_SM, fmt_probe_command(bit_count, true, CMD_WRITE));
+-    pio_sm_put_blocking(pio0, PROBE_SM, data_byte);
++    pio_sm_put_blocking(PROBE_PIO, probe.sm, fmt_probe_command(bit_count, true, CMD_WRITE));
++    pio_sm_put_blocking(PROBE_PIO, probe.sm, data_byte);
+@@ -117,2 +122,2 @@
+-    pio_sm_put_blocking(pio0, PROBE_SM, fmt_probe_command(bit_count, false, CMD_TURNAROUND));
+-    pio_sm_put_blocking(pio0, PROBE_SM, 0);
++    pio_sm_put_blocking(PROBE_PIO, probe.sm, fmt_probe_command(bit_count, false, CMD_TURNAROUND));
++    pio_sm_put_blocking(PROBE_PIO, probe.sm, 0);
+@@ -123,2 +128,2 @@
+-    pio_sm_put_blocking(pio0, PROBE_SM, fmt_probe_command(bit_count, false, CMD_READ));
+-    uint32_t data = pio_sm_get_blocking(pio0, PROBE_SM);
++    pio_sm_put_blocking(PROBE_PIO, probe.sm, fmt_probe_command(bit_count, false, CMD_READ));
++    uint32_t data = pio_sm_get_blocking(PROBE_PIO, probe.sm);
+@@ -136,2 +141,2 @@
+-    pio0->fdebug = 1u << (PIO_FDEBUG_TXSTALL_LSB + PROBE_SM);
+-    while (!(pio0->fdebug & (1u << (PIO_FDEBUG_TXSTALL_LSB + PROBE_SM))))
++    PROBE_PIO->fdebug = 1u << (PIO_FDEBUG_TXSTALL_LSB + probe.sm);
++    while (!(PROBE_PIO->fdebug & (1u << (PIO_FDEBUG_TXSTALL_LSB + probe.sm))))
+@@ -142 +147 @@
+-    pio_sm_put_blocking(pio0, PROBE_SM, fmt_probe_command(0, false, CMD_SKIP));
++    pio_sm_put_blocking(PROBE_PIO, probe.sm, fmt_probe_command(0, false, CMD_SKIP));
+@@ -147 +152 @@
+-    pio_sm_put_blocking(pio0, PROBE_SM, fmt_probe_command(0, true, CMD_SKIP));
++    pio_sm_put_blocking(PROBE_PIO, probe.sm, fmt_probe_command(0, true, CMD_SKIP));
+@@ -154 +159,5 @@
+-        uint offset = pio_add_program(pio0, &probe_program);
++        // Claim a free SM on PROBE_PIO dynamically — never assume a fixed index.
++        // In the merged (PicoGremlin) build PROBE_PIO is shared silicon; a
++        // hardcoded SM here would silently collide with whatever else claims pio1.
++        probe.sm = (uint)pio_claim_unused_sm(PROBE_PIO, true);
++        uint offset = pio_add_program(PROBE_PIO, &probe_program);
+@@ -158,2 +167,2 @@
+-        probe_sm_init(&sm_config);
+-        pio_sm_init(pio0, PROBE_SM, offset, &sm_config);
++        probe_sm_init(&sm_config, probe.sm);
++        pio_sm_init(PROBE_PIO, probe.sm, offset, &sm_config);
+@@ -165,2 +174,2 @@
+-        pio_sm_exec(pio0, PROBE_SM, offset + probe_offset_get_next_cmd);
+-        pio_sm_set_enabled(pio0, PROBE_SM, 1);
++        pio_sm_exec(PROBE_PIO, probe.sm, offset + probe_offset_get_next_cmd);
++        pio_sm_set_enabled(PROBE_PIO, probe.sm, 1);
+@@ -175,2 +184,3 @@
+-    pio_sm_set_enabled(pio0, PROBE_SM, 0);
+-    pio_remove_program(pio0, &probe_program, probe.offset);
++    pio_sm_set_enabled(PROBE_PIO, probe.sm, 0);
++    pio_remove_program(PROBE_PIO, &probe_program, probe.offset);
++    pio_sm_unclaim(PROBE_PIO, probe.sm);
+--- a/src/probe.pio
++++ b/src/probe.pio
+@@ -83,2 +83,2 @@
+-    pio_gpio_init(pio0, PROBE_PIN_SWCLK);
+-    pio_gpio_init(pio0, PROBE_PIN_SWDIO);
++    pio_gpio_init(PROBE_PIO, PROBE_PIN_SWCLK);
++    pio_gpio_init(PROBE_PIO, PROBE_PIN_SWDIO);
+@@ -102 +102 @@
+-static inline void probe_sm_init(pio_sm_config* sm_config) {
++static inline void probe_sm_init(pio_sm_config* sm_config, uint sm) {
+@@ -117,2 +117,6 @@
+-    // Set SWD and SWDIO pins as output to start. This will be set in the sm
+-    pio_sm_set_consecutive_pindirs(pio0, PROBE_SM, PROBE_PIN_OFFSET, 2, true);
++    // Set SWD and SWDIO pins as output to start. This will be set in the sm.
++    // SWCLK/SWDIO are not necessarily adjacent GPIOs (e.g. GP23/GP29 on the
++    // PicoGremlin Pico 2 W board), so each pin is set independently rather than
++    // via a single consecutive-range call.
++    pio_sm_set_consecutive_pindirs(PROBE_PIO, sm, PROBE_PIN_SWCLK, 1, true);
++    pio_sm_set_consecutive_pindirs(PROBE_PIO, sm, PROBE_PIN_SWDIO, 1, true);

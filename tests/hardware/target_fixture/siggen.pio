@@ -1,0 +1,48 @@
+; PicoGremlin hardware-test target fixture: configurable square-wave generator.
+;
+; Two independent PIO state machines (one per output, GPIO16 / GPIO17) generate
+; square waves with independently configurable frequency, duty cycle and phase.
+; GPIO16 and GPIO17 share PWM slice 8 on RP2350, so hardware PWM alone cannot
+; provide independent frequency + phase; PIO is used instead.
+;
+; Program layout (pull-based, fed ONCE at init):
+;   FIFO word 1: phase delay in SM-clock ticks (consumed once at start)
+;   FIFO word 2: HIGH count in ticks  -> held in Y permanently
+;   FIFO word 3: LOW  count in ticks  -> held in ISR permanently
+; The loop reloads X from Y / ISR each period, so the waveform runs forever
+; without any further FIFO traffic.
+;
+; Per-phase instruction overhead is 2 SM-clock ticks (set + mov), so firmware
+; programs counts = requested_ticks - 2. Period = 4 + high + low ticks.
+
+.program siggen
+    pull block              ; phase delay (consumed once)
+    mov x, osr
+phase_delay:
+    jmp x-- phase_delay
+    pull block              ; HIGH count
+    mov y, osr
+    pull block              ; LOW count
+    mov isr, osr
+.wrap_target
+loop:
+    set pins, 1
+    mov x, y
+high_loop:
+    jmp x-- high_loop
+    set pins, 0
+    mov x, isr
+low_loop:
+    jmp x-- low_loop
+.wrap
+
+; Fast mode for very high frequencies: fixed 50 % duty, period = 2 SM-clock ticks.
+; Frequency is set with the SM clock divider. Both state machines run the same
+; period forever, so a one-time start offset produces a constant phase offset.
+; No runtime duty adjustment is possible in this mode.
+.program siggen_fast
+.wrap_target
+loop:
+    set pins, 1
+    set pins, 0
+.wrap

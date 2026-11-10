@@ -1,0 +1,527 @@
+--- a/Firmware/LogicAnalyzer_V2/LogicAnalyzer.c
++++ b/Firmware/LogicAnalyzer_V2/LogicAnalyzer.c
+@@ -1,4 +1,8 @@
+ #include "LogicAnalyzer_Board_Settings.h"
++#ifdef MERGED_BUILD
++#include "board_merged_config.h"
++#endif
++
+ 
+ #include <stdio.h>
+ #include <string.h>
+@@ -18,6 +22,11 @@
+ #include "pico/unique_id.h"
+ #include "pico/bootrom.h"
+ 
++#ifdef MERGED_BUILD
++#include "la_bridge.h"
++#endif
++bool StartCaptureImmediate(uint32_t freq, uint32_t length, const uint8_t* capturePins, uint8_t capturePinCount, CHANNEL_MODE captureMode);
++
+ #ifdef WS2812_LED
+     #include "LogicAnalyzer_W2812.h"
+ #endif
+@@ -79,6 +88,16 @@
+     #define INIT_LED() init_rgb()
+     #define LED_ON() send_rgb(0,32,0)
+     #define LED_OFF() send_rgb(0,0,32)
++#else
++    // MERGED_BUILD (PicoGremlin): no LED type is defined for BUILD_PICO_2 (see
++    // LogicAnalyzer_Board_Settings.h's #ifndef MERGED_BUILD guard around
++    // GPIO_LED/LED_IO 25) — GPIO25 is the probe's UART bridge RX pin on this
++    // board and must not be driven as an activity LED. la_main()'s INIT_LED()/
++    // LED_ON()/LED_OFF() calls are unconditional, so they need a real (empty)
++    // definition here rather than being left undefined.
++    #define INIT_LED() { }
++    #define LED_ON() { }
++    #define LED_OFF() { }
+ #endif
+ 
+ //Buffer used to store received data
+@@ -160,7 +179,23 @@
+     }
+     else
+     #endif
++        #ifdef MERGED_BUILD
++        {
++            size_t sr_len = strlen(response);
++            size_t sr_pos = 0;
++            while (sr_pos < sr_len) {
++                uint32_t transferred = la_bridge_write(response + sr_pos, (uint32_t)(sr_len - sr_pos));
++                if (transferred == 0) {
++                    if (!la_bridge_connected()) break;   /* host gone — stop retrying */
++                    sleep_ms(1);
++                    continue;
++                }
++                sr_pos += transferred;
++            }
++        }
++        #else
+         printf(response);
++        #endif
+ }
+ 
+ /// @brief Transfer a buffer of data through USB using the TinyUSB CDC functions
+@@ -169,8 +204,22 @@
+ void cdc_transfer(unsigned char* data, int len)
+ {
+ 
+-    int left = len;
++    #ifdef MERGED_BUILD
+     int pos = 0;
++    while (pos < len) {
++        uint32_t transferred = la_bridge_write(data + pos, (uint32_t)(len - pos));
++        if (transferred == 0) {
++            if (!la_bridge_connected()) break;   /* host gone — don't spin forever */
++            sleep_ms(1);
++            continue;
++        }
++        pos += (int)transferred;
++    }
++    return;
++    #endif
++
++    int left = len;
++    int usb_pos = 0;
+ 
+     while(left > 0)
+     {
+@@ -181,11 +230,11 @@
+ 
+         if(avail)
+         {
+-            int transferred = (int) tud_cdc_write(data + pos, avail);
++            int transferred = (int) tud_cdc_write(data + usb_pos, avail);
+             tud_task();
+             tud_cdc_write_flush();
+             
+-            pos += transferred;
++            usb_pos += transferred;
+             left -= transferred;
+         }
+         else
+@@ -206,6 +255,11 @@
+ {
+     for(uint pos = 0; pos < length; pos++)
+     {
++        if(bufferPos >= sizeof(messageBuffer))
++        {
++            sendResponse("ERR_MSG_OVERFLOW\n", fromWiFi);
++            bufferPos = 0;
++        }
+         //Store char in buffer and increment position
+         messageBuffer[bufferPos++] = data[pos];
+         
+@@ -214,7 +268,7 @@
+             bufferPos = 0;
+         else if(bufferPos == 2 && messageBuffer[1] != 0xAA) //If we have stored the second byte and it is not 0xAA restart reception
+             bufferPos = 0;
+-        else if(bufferPos >= 256) //Have we overflowed the buffer? then inform to the host and restart reception
++        else if(bufferPos >= sizeof(messageBuffer)) //Have we overflowed the buffer? then inform to the host and restart reception
+         {
+             sendResponse("ERR_MSG_OVERFLOW\n", fromWiFi);
+             bufferPos = 0;
+@@ -356,10 +410,98 @@
+ 
+                     #else
+ 
+-                    case 2:
+-                    case 3:
++                    case 0x41: // STREAM_START — continuous gapless streaming until CMD=0x42 received
++                    {
++                        CAPTURE_REQUEST* sreq = (CAPTURE_REQUEST*)&messageBuffer[3];
++
++                        uint32_t batchSamples = sreq->postSamples;
++                        if (batchSamples == 0) batchSamples = 512;
++
++                        uint8_t  cap_mode = sreq->captureMode;
++                        uint8_t  ch_count = sreq->channelCount;
++                        uint8_t* ch_ptr   = (uint8_t*)&sreq->channels;
++                        uint32_t cap_freq = sreq->frequency;
++                        sendResponse("STREAM_STARTED\n", fromWiFi);
++                        LED_OFF();
++
++                        bool streaming  = true;
++                        uint8_t stop_state = 0; // CMD=0x42 frame detector: 0=init,1=saw 0x55,2=saw 0xAA
++
++                        while (streaming) {
++                            // Stop if host disconnected (CDC DTR dropped — server closed port)
++                            if (!la_bridge_connected()) break;
++
++                            bool started = StartCaptureImmediate(cap_freq, batchSamples,
++                                ch_ptr, ch_count, (CHANNEL_MODE)cap_mode);
++
++                            if (!started) {
++                                sendResponse("STREAM_ERROR\n", fromWiFi);
++                                break;
++                            }
+ 
+-                        sendResponse("ERR_UNSUPPORTED\n", fromWiFi);
++                            // Wait for batch; poll for CMD=0x42 stop frame (0x55 0xAA 0x42 ...)
++                            while (IsCapturing()) {
++#ifdef MERGED_BUILD
++                                int c = la_bridge_getc();
++#else
++                                int c = (int)getchar_timeout_us(0);
++                                if (c == PICO_ERROR_TIMEOUT) c = -1;
++#endif
++                                if (c >= 0) {
++                                    uint8_t b = (uint8_t)c;
++                                    if      (b == 0x55)                      stop_state = 1;
++                                    else if (stop_state == 1 && b == 0xAA)  stop_state = 2;
++                                    else if (stop_state == 2 && b == 0x42) { streaming = false; break; }
++                                    else                                      stop_state = 0;
++                                }
++                            }
++
++                            if (!streaming) {
++                                StopCapture();
++                                break;
++                            }
++
++                            // Send batch: 4-byte sample count then linearized raw bytes
++                            uint32_t bufLen, firstSample;
++                            CHANNEL_MODE mode;
++                            uint8_t* buf = GetBuffer(&bufLen, &firstSample, &mode);
++
++                            uint32_t bps      = (mode == MODE_8_CHANNEL) ? 1u :
++                                                (mode == MODE_16_CHANNEL) ? 2u : 4u;
++                            uint32_t byteLen  = bufLen * bps;
++                            uint32_t firstByte = firstSample * bps;
++
++                            cdc_transfer((uint8_t*)&bufLen, 4);
++
++                            if (firstByte + byteLen > CAPTURE_BUFFER_SIZE) {
++                                cdc_transfer(buf + firstByte, CAPTURE_BUFFER_SIZE - firstByte);
++                                cdc_transfer(buf, (firstByte + byteLen) - CAPTURE_BUFFER_SIZE);
++                            } else {
++                                cdc_transfer(buf + firstByte, byteLen);
++                            }
++
++                            // Drain rx_buf after sending: CMD=3 may have arrived during cdc_transfer
++#ifdef MERGED_BUILD
++                            {
++                                int c;
++                                while ((c = la_bridge_getc()) >= 0) {
++                                    uint8_t b = (uint8_t)c;
++                                    if      (b == 0x55)                     stop_state = 1;
++                                    else if (stop_state == 1 && b == 0xAA) stop_state = 2;
++                                    else if (stop_state == 2 && b == 0x42) { streaming = false; break; }
++                                    else                                     stop_state = 0;
++                                }
++                            }
++#endif
++                        }
++
++                        LED_ON();
++                        sendResponse("STREAM_STOPPED\n", fromWiFi);
++                        break;
++                    }
++
++                    case 0x42: // STREAM_STOP — only if received outside of a streaming loop
++                        sendResponse("STREAM_STOPPED\n", fromWiFi);
+                         break;
+ 
+                     #endif
+@@ -422,12 +564,18 @@
+ /// @return True if anything is received, false if not
+ bool processUSBInput(bool skipProcessing)
+ {
++    #ifdef MERGED_BUILD
++    int data = la_bridge_getc();
++    if (data < 0)
++        return false;
++    #else
+     //Try to get char
+     uint data = getchar_timeout_us(0);
+ 
+     //Timeout? Then leave
+     if(data == PICO_ERROR_TIMEOUT)
+         return false;
++    #endif
+ 
+     uint8_t filteredData = (uint8_t)data;
+ 
+@@ -547,22 +695,24 @@
+ 
+ /// @brief Main app loop
+ /// @return Exit code
+-int main()
++void la_main()
+ {
++    #ifndef MERGED_BUILD
+     #if defined (TURBO_MODE)
+ 
+         vreg_disable_voltage_limit();
+         vreg_set_voltage(VREG_VOLTAGE_1_30);
+         sleep_ms(1);
+-        
++
+         //Overclock Powerrrr!
+         set_sys_clock_khz(400000, true);
+-    
++
+     #else
+ 
+         set_sys_clock_khz(200000, true);
+ 
+     #endif
++    #endif
+ 
+     //Enable systick using CPU clock
+     systick_hw->csr = 0x05;
+@@ -770,5 +920,5 @@
+         }
+     }
+ 
+-    return 0;
++    return;
+ }
+\ No newline at end of file
+
+--- a/Firmware/LogicAnalyzer_V2/LogicAnalyzer_Board_Settings.h
++++ b/Firmware/LogicAnalyzer_V2/LogicAnalyzer_Board_Settings.h
+@@ -66,8 +66,18 @@
+         #define INPUT_PIN_BASE 2
+         #define COMPLEX_TRIGGER_OUT_PIN 0
+         #define COMPLEX_TRIGGER_IN_PIN 1
++        #ifndef MERGED_BUILD
++        // In the PicoGremlin merged build GPIO25 is the probe's UART bridge RX
++        // pin (see picogremlin/firmware/board_merged_config.h) — driving it as an
++        // activity LED here would fight gpio_set_function(25, GPIO_FUNC_UART).
++        #ifndef MERGED_BUILD
++        // In the PicoGremlin merged build GPIO25 is the probe's UART bridge RX
++        #endif
++        // pin (see picogremlin/firmware/board_merged_config.h) — driving it as an
++        // activity LED here would fight gpio_set_function(25, GPIO_FUNC_UART).
+         #define GPIO_LED
+         #define LED_IO 25
++        #endif
+ 
+         #ifdef TURBO_MODE
+             #define MAX_FREQ 200000000
+
+--- a/Firmware/LogicAnalyzer_V2/LogicAnalyzer_Capture.c
++++ b/Firmware/LogicAnalyzer_V2/LogicAnalyzer_Capture.c
+@@ -11,12 +11,21 @@
+ #include "hardware/structs/systick.h"
+ #include "hardware/structs/bus_ctrl.h"
+ #include "LogicAnalyzer.pio.h"
++#ifdef MERGED_BUILD
++#include "board_merged_config.h"
++#define LA_CAPTURE_PIO_FAST LA_FAST_CAPTURE_PIO
++#else
++#define LA_CAPTURE_PIO_FAST pio1
++#endif
++
+ 
+ //Static variables for the PIO programs
+ static PIO capturePIO;
+ static PIO triggerPIO;
+ 
+ static uint sm_Capture;
++static const struct pio_program *captureProgram;
++
+ static uint captureOffset;
+ 
+ static uint sm_Trigger;
+@@ -287,6 +296,8 @@
+     pio_interrupt_clear(capturePIO, 0);
+ 
+     //Stop PIO capture program and clear
++    captureProgram = NULL;
++
+     pio_sm_set_enabled(capturePIO, sm_Capture, false);
+     pio_sm_unclaim(capturePIO, sm_Capture);
+     
+@@ -328,6 +339,8 @@
+ 
+     //Stop PIO capture program and clear
+     pio_sm_set_enabled(capturePIO, sm_Capture, false);
++    captureProgram = NULL;
++
+     pio_sm_unclaim(capturePIO, sm_Capture);
+     
+     pio_remove_program(capturePIO, &COMPLEX_CAPTURE_program, captureOffset);
+@@ -354,6 +367,8 @@
+ 
+     //Not needed, left for sanity
+     hw_clear_bits(&dma_hw->ch[dmaPingPong0].al1_ctrl, DMA_CH0_CTRL_TRIG_EN_BITS);
++    dma_channel_abort(dmaPingPong0);
++    dma_channel_acknowledge_irq0(dmaPingPong0);
+ 
+     //Disable IRQ0
+     dma_channel_set_irq0_enabled(dmaPingPong0, false); //Enable IRQ 0
+@@ -370,6 +385,8 @@
+ 
+     //Stop PIO program and clear
+     pio_sm_set_enabled(capturePIO, sm_Capture, false);
++    captureProgram = NULL;
++
+     pio_sm_unclaim(capturePIO, sm_Capture);
+     
+     pio_remove_program(capturePIO, &BLAST_CAPTURE_program, captureOffset);
+@@ -415,10 +432,11 @@
+     pio_sm_set_enabled(capturePIO, sm_Capture, false);
+     pio_sm_unclaim(capturePIO, sm_Capture);
+     
+-    if(lastTriggerInverted)
+-        pio_remove_program(capturePIO, &POSITIVE_CAPTURE_program, captureOffset);
+-    else
+-        pio_remove_program(capturePIO, &NEGATIVE_CAPTURE_program, captureOffset);
++    if(captureProgram != NULL)
++    {
++        pio_remove_program(capturePIO, captureProgram, captureOffset);
++        captureProgram = NULL;
++    }
+ 
+     //Mark the capture as finished
+     captureFinished = true;
+@@ -461,8 +479,12 @@
+     irq_set_enabled(DMA_IRQ_0, true);
+     irq_set_priority(DMA_IRQ_0, 0);
+ 
+-    //Full priority to the DMA
++    //Full priority to the DMA (standalone LA only). In the merged probe+LA
++    //build core0 services USB + CMSIS-DAP from SRAM; absolute DMA bus priority
++    //starves it and freezes the probe for the whole capture, so skip it here.
++#ifndef MERGED_BUILD
+     bus_ctrl_hw->priority = BUSCTRL_BUS_PRIORITY_DMA_W_BITS | BUSCTRL_BUS_PRIORITY_DMA_R_BITS;
++#endif
+ 
+     dma_channel_configure(dmaPingPong0, &dmaConfig, captureBuffer, &capturePIO->rxf[sm_Capture], length, true); //Configure the channel and trigger it
+    
+@@ -533,7 +555,8 @@
+     {
+         //Ensure the DMA channels are stopped, else they will overrun the buffer when the interrupts are disabled
+         hw_clear_bits(&dma_hw->ch[dmaPingPong0].al1_ctrl, DMA_CH0_CTRL_TRIG_EN_BITS);
+-        hw_clear_bits(&dma_hw->ch[dmaPingPong1].al1_ctrl, DMA_CH0_CTRL_TRIG_EN_BITS);
++        if(lastCaptureType != CAPTURE_TYPE_BLAST)
++            hw_clear_bits(&dma_hw->ch[dmaPingPong1].al1_ctrl, DMA_CH0_CTRL_TRIG_EN_BITS);
+ 
+         uint32_t int_status = save_and_disable_interrupts();
+ 
+@@ -636,7 +659,7 @@
+     float clockDiv = (float)clock_get_hz(clk_sys) / (float)(freq * 2);
+ 
+     //Store the PIO units and clear program memory
+-    capturePIO = pio1; //Cannot clear it in PIO1 because the W uses PIO1 to transfer data
++    capturePIO = LA_CAPTURE_PIO_FAST;
+     triggerPIO = pio0;
+ 
+     pio_clear_instruction_memory(triggerPIO);
+@@ -653,6 +676,7 @@
+     pio_sm_clear_fifos(capturePIO, sm_Capture);
+     pio_sm_restart(capturePIO, sm_Capture);
+     captureOffset = pio_add_program(capturePIO, &FAST_CAPTURE_program);
++    captureProgram = &FAST_CAPTURE_program;
+ 
+     //Modified for the W
+     for(int i = 0; i < 24; i++)
+@@ -820,6 +844,7 @@
+     pio_sm_clear_fifos(capturePIO, sm_Capture);
+     pio_sm_restart(capturePIO, sm_Capture);
+     captureOffset = pio_add_program(capturePIO, &COMPLEX_CAPTURE_program);
++    captureProgram = &COMPLEX_CAPTURE_program;
+ 
+     for(int i = 0; i < 24; i++)
+         pio_sm_set_consecutive_pindirs(capturePIO, sm_Capture, pinMap[i], 1, false);
+@@ -979,6 +1004,7 @@
+ 
+     //Load program
+     captureOffset = pio_add_program(capturePIO, &BLAST_CAPTURE_program);
++    captureProgram = &BLAST_CAPTURE_program;
+ 
+     //Configure capture pins
+     for(int i = 0; i < 24; i++)
+@@ -1031,6 +1057,61 @@
+     return true;
+ }
+ 
++bool StartCaptureImmediate(uint32_t freq, uint32_t length, const uint8_t* capturePins, uint8_t capturePinCount, CHANNEL_MODE captureMode)
++{
++    int maxSamples;
++    switch (captureMode) {
++        case MODE_8_CHANNEL:  maxSamples = CAPTURE_BUFFER_SIZE;     break;
++        case MODE_16_CHANNEL: maxSamples = CAPTURE_BUFFER_SIZE / 2; break;
++        case MODE_24_CHANNEL: maxSamples = CAPTURE_BUFFER_SIZE / 4; break;
++        default: return false;
++    }
++
++    if (length > (uint32_t)maxSamples) return false;
++    if (freq > MAX_BLAST_FREQ) return false;
++    if (capturePinCount < 1 || capturePinCount > MAX_CHANNELS) return false;
++
++    memset(captureBuffer, 0, sizeof(captureBuffer));
++    lastPreSize = 0; lastPostSize = length; lastLoopCount = 0;
++    lastCapturePinCount = capturePinCount; lastTriggerInverted = false;
++    lastCaptureComplexFast = false; lastCaptureMode = captureMode;
++
++    for (uint8_t i = 0; i < capturePinCount; i++)
++        lastCapturePins[i] = pinMap[capturePins[i]];
++
++    float clockDiv = (float)clock_get_hz(clk_sys) / (float)freq;
++
++    capturePIO = pio0;
++    pio_clear_instruction_memory(capturePIO);
++    sm_Capture = pio_claim_unused_sm(capturePIO, true);
++    pio_sm_clear_fifos(capturePIO, sm_Capture);
++    pio_sm_restart(capturePIO, sm_Capture);
++    captureOffset = pio_add_program(capturePIO, &BLAST_CAPTURE_program);
++    captureProgram = &BLAST_CAPTURE_program;
++
++    for (int i = 0; i < 24; i++)
++        pio_sm_set_consecutive_pindirs(capturePIO, sm_Capture, pinMap[i], 1, false);
++    for (uint8_t i = 0; i < 24; i++)
++        pio_gpio_init(capturePIO, pinMap[i]);
++
++    pio_sm_config smConfig = BLAST_CAPTURE_program_get_default_config(captureOffset);
++    sm_config_set_in_pins(&smConfig, INPUT_PIN_BASE);
++    sm_config_set_clkdiv(&smConfig, clockDiv);
++    sm_config_set_in_shift(&smConfig, true, true, 0);
++    sm_config_set_jmp_pin(&smConfig, INPUT_PIN_BASE); // dummy — exec-jump below skips the jmp
++
++    pio_sm_set_enabled(capturePIO, sm_Capture, false);
++    pio_sm_init(capturePIO, sm_Capture, captureOffset, &smConfig);
++    // Skip the trigger-wait instruction (jmp pin LOOP at captureOffset+0);
++    // start the SM directly at the wrap_target (in pins 32 at captureOffset+1).
++    pio_sm_exec(capturePIO, sm_Capture, pio_encode_jmp(captureOffset + 1));
++    configureBlastDMA(captureMode, length);
++    pio_sm_set_enabled(capturePIO, sm_Capture, true);
++
++    captureFinished = false; captureProcessed = false; lastCaptureType = CAPTURE_TYPE_BLAST;
++    return true;
++}
++
+ bool StartCaptureSimple(uint32_t freq, uint32_t preLength, uint32_t postLength, uint8_t loopCount, uint8_t measureBursts, const uint8_t* capturePins, uint8_t capturePinCount, uint8_t triggerPin, bool invertTrigger, CHANNEL_MODE captureMode)
+ {
+     int maxSamples;
+@@ -1100,16 +1181,28 @@
+     if(invertTrigger)
+     {
+         if(measureBursts)
++        {
+             captureOffset = pio_add_program(capturePIO, &NEGATIVE_CAPTURE_MEASUREBURSTS_program);
++            captureProgram = &NEGATIVE_CAPTURE_MEASUREBURSTS_program;
++        }
+         else
++        {
+             captureOffset = pio_add_program(capturePIO, &NEGATIVE_CAPTURE_program);
++            captureProgram = &NEGATIVE_CAPTURE_program;
++        }
+     }
+     else
+     {
+         if(measureBursts)
++        {
+             captureOffset = pio_add_program(capturePIO, &POSITIVE_CAPTURE_MEASUREBURSTS_program);
++            captureProgram = &POSITIVE_CAPTURE_MEASUREBURSTS_program;
++        }
+         else
++        {
+             captureOffset = pio_add_program(capturePIO, &POSITIVE_CAPTURE_program);
++            captureProgram = &POSITIVE_CAPTURE_program;
++        }
+         
+     }
+ 

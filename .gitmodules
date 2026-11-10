@@ -1,0 +1,7 @@
+[submodule "debugprobe"]
+	path = debugprobe
+	url = https://github.com/raspberrypi/debugprobe.git
+
+[submodule "logicanalyzer"]
+	path = logicanalyzer
+	url = https://github.com/gusmanb/logicanalyzer.git

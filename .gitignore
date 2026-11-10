@@ -1,0 +1,15 @@
+build/
+build-*/
+logs/
+*.uf2
+*.elf
+*.map
+*.bin
+*.hex
+__pycache__/
+*.pyc
+.DS_Store
+
+# generated locally, not part of the release
+boards.csv
+tests/hardware/artifacts/

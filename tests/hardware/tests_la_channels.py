@@ -29,7 +29,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from picogremlin_hil import (
-    SerialPort, find_ports, la_capture, fix_mask, fix_walk, fix_comb,
+    SerialPort, find_ports, la_capture, fix_mask, fix_walk, fix_comb, fix_exclude,
     fix_gen_channels, fix_set_inputs, fix_heart, fix_configure, fix_identity,
     fix_echo, channel_metrics, target_symbol_address, oocd_argv,
 )
@@ -57,14 +57,18 @@ def oocd_read_gpio_in():
 
 
 class Runner:
-    def __init__(self, out, wired):
+    def __init__(self, out, wired, resume=False):
         os.makedirs(out, exist_ok=True)
         self.out = out
         self.wired = wired
         self.wiredset = set(wired)
         self.results = []
         self.json_path = os.path.join(out, "channels_test_results.json")
-        self._load()
+        self.resume = resume
+        if resume:
+            self._load()
+        else:
+            self.save()          # a normal run starts a fresh results file
 
     def _load(self):
         if os.path.exists(self.json_path):
@@ -76,7 +80,13 @@ class Runner:
             json.dump({"results": self.results}, f, indent=2)
 
     def rec(self, name, status, **details):
-        self.results.append({"name": name, "status": status, **details})
+        entry = {"name": name, "status": status, **details}
+        for i, old in enumerate(self.results):
+            if old["name"] == name:
+                self.results[i] = entry       # keep one row per check on --resume
+                break
+        else:
+            self.results.append(entry)
         self.save()
         print(f"[{status}] {name} {details}", flush=True)
 
@@ -87,22 +97,49 @@ def main():
         os.path.dirname(os.path.abspath(__file__)), "artifacts", "channels"))
     ap.add_argument("--wired", default=",".join(map(str, WIRED_DEFAULT)))
     ap.add_argument("--wired-dyn", default=",".join(map(str, WIRED_DYN_DEFAULT)))
+    ap.add_argument("--exclude", default="",
+                    help="channels the fixture must not drive, e.g. '11' or 'GP13' "
+                         "(a bench pin such as a buzzer); empty = full coverage")
+    ap.add_argument("--resume", action="store_true",
+                    help="keep results from earlier runs instead of starting a fresh file")
     ap.add_argument("--only", default="all",
                     help="comma list of T1..T7 (default all)")
     args = ap.parse_args()
-    wired = [int(x) for x in args.wired.split(",")]
-    wired_dyn = [int(x) for x in args.wired_dyn.split(",")]
+    def _chan(tok):
+        t = tok.strip().lower()
+        if not t:
+            return None
+        if t.startswith("gp"):
+            gp = int(t[2:])
+            if 2 <= gp <= 22:
+                return gp - 2
+            if 26 <= gp <= 28:
+                return 21 + (gp - 26)
+            raise SystemExit(f"GP{gp} is not an LA channel")
+        return int(t)
+
+    excluded = {c for c in (_chan(t) for t in args.exclude.split(",")) if c is not None}
+    wired = [int(x) for x in args.wired.split(",") if int(x) not in excluded]
+    wired_dyn = [int(x) for x in args.wired_dyn.split(",") if int(x) not in excluded]
     only = set(args.only.split(","))
 
     uart, la = find_ports()
     up = SerialPort(uart, 115200)
     lp = SerialPort(la, 115200)
     time.sleep(0.5)
-    r = Runner(args.out, wired)
+    r = Runner(args.out, wired, resume=args.resume)
 
     ident = fix_identity(up)
     r.rec("fixture-ready", "PASS" if ident and b"PICOGREMLIN_TARGET_FIXTURE" in ident
-          else "FAIL", ident=ident.decode(errors="replace").strip())
+          else "FAIL", ident=ident.decode(errors="replace").strip(),
+          excluded=sorted(excluded) if excluded else None)
+    if excluded:
+        mask = sum(1 << c for c in excluded)
+        if not fix_exclude(up, mask):
+            r.rec("fixture-exclude", "FAIL", mask=mask)
+        else:
+            r.rec("fixture-exclude", "PASS", channels=sorted(excluded),
+                  note="these pins are held as inputs for this run")
 
     def capture(channels, freq, pre, post, trigger_type=0, trigger=0,
                 inverted=0, trigger_value=0):

@@ -1,7 +1,7 @@
                     case 0x40: // PG_INFO — PicoGremlin extras (upstream's 0-6 stay stock)
                     {
                         char pgmsg[96];
-                        sprintf(pgmsg, "PICOGREMLIN:@PROBE_VERSION@\nSTREAM:1\nANALOG:3,500000,1\n");
+                        sprintf(pgmsg, "PICOGREMLIN:@PROBE_VERSION@\nSTREAM:1\nANALOG:3,250000,1\n");
                         sendResponse(pgmsg, fromWiFi);
 #ifdef PROBE_CDC_UART
                         sprintf(pgmsg, "BRIDGE_TX:%d\n",

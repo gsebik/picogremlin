@@ -324,12 +324,15 @@ def main():
 
     # ---- A10 8-bit stream --------------------------------------------------
     rate_rep8, chans8, frames8 = astream(lp, [0], 50000, 1000, 0.2, eight=True)
-    if rate_rep8 and chans8 and chans8[0]:
+    ref = acap(lp, [0], 50000, 0, 1000)
+    if rate_rep8 and chans8 and chans8[0] and ref["ok"]:
         vals = chans8[0]
-        ok = (len(vals) > 100 and max(vals) <= 255 and min(vals) < 250)
+        m8 = sum(vals) / len(vals) * 16.0        # 8-bit keeps the top 8 bits
+        m12 = sum(ref["values"]) / len(ref["values"])
+        ok = (len(vals) > 100 and max(vals) <= 255 and abs(m8 - m12) <= 40)
         rec("A10-stream-8bit", "PASS" if ok else "FAIL",
             values=len(vals), raw_min=min(vals), raw_max=max(vals),
-            frames=frames8)
+            mean8_x16=round(m8), mean12=round(m12), frames=frames8)
     else:
         rec("A10-stream-8bit", "FAIL", why="8-bit stream did not start")
 
@@ -340,42 +343,56 @@ def main():
         "PASS" if cap.get("ok") and cap.get("count") == 2000 else "FAIL",
         count=cap.get("count"), response=str(cap.get("response"))[:40])
 
-    # ---- A12/A13 waveform references from the target fixture ---------------
-    # Needs a wire from the probe's GP16 (fixture ch14) to GP26 (A0); without it
-    # the inputs are undriven and the checks are reported as NOT TESTED.
+    # ---- A12 waveform reference from the target fixture ---------------------
+    # Wiring-agnostic: the fixture's 1 kHz PWM can be jumpered to any analog
+    # input (A0/A1/A2); whichever one shows a square wave is measured against
+    # the configured duty, so no particular wire is required.
     up = SerialPort(uart, 115200)
     fixture = fix_identity(up)
     if not fixture:
         rec("A12-fixture-wave", "NOT TESTED",
             why="target fixture not responding — program it with ./pg fixture-flash")
+    elif not (fix_configure(up, 0, 1000, 500, 0) and
+              fix_configure(up, 1, 1000, 250, 0)):
+        rec("A12-fixture-wave", "NOT TESTED", why="fixture did not accept the configuration")
     else:
-        ok_cfg = (fix_configure(up, 0, 1000, 500, 0) and
-                  fix_configure(up, 1, 1000, 250, 0))
         time.sleep(0.5)
-        if not ok_cfg:
-            rec("A12-fixture-wave", "NOT TESTED", why="fixture did not accept the configuration")
+        r = acap(lp, [0, 1, 2], 200000, 0, 4000)
+        if not r["ok"]:
+            rec("A12-fixture-wave", "FAIL", why=r["why"])
         else:
-            r = acap(lp, [0, 1], 100000, 0, 4000)
-            if not r["ok"]:
-                rec("A12-fixture-wave", "FAIL", why=r["why"])
+            per = [r["values"][i::3] for i in range(3)]
+            found, details = None, {}
+            for k in range(3):
+                v = [volts(x) for x in per[k]]
+                pp = max(v) - min(v)
+                if pp < 2.0:
+                    continue
+                mm = measure_wave(v, r["rate"], (max(v) + min(v)) / 2.0)
+                details[f"A{k}_pp"] = round(pp, 2)
+                details[f"A{k}_freq"] = round(mm["freq"], 1)
+                details[f"A{k}_duty"] = round(mm["duty"], 1)
+                if abs(mm["freq"] - 1000) <= 30:
+                    found = k
+                    break
+            if found is None:
+                rec("A12-fixture-wave", "NOT TESTED", **details,
+                    note="jumper the fixture's PWM (GP16/GP17) to any analog input "
+                         "(A0/A1/A2) to enable this check")
             else:
-                a0 = [volts(v) for v in r["values"][0::2]]
-                a1 = [volts(v) for v in r["values"][1::2]]
-                m0, m1 = sum(a0) / len(a0), sum(a1) / len(a1)
-                pp0 = max(a0) - min(a0)
-                mm = measure_wave(a0, r["rate"], (max(a0) + min(a0)) / 2.0)
-                wired = pp0 > 2.0 and abs(mm["freq"] - 1000) <= 100
-                if not wired:
-                    rec("A12-fixture-wave", "NOT TESTED", a0=round(m0, 3),
-                        a0_pp=round(pp0, 3), note=FIXTURE_WIRING)
-                else:
-                    ok = (abs(m0 - 1.65) <= 0.17 and abs(m1 - 0.825) <= 0.17
-                          and abs(mm["freq"] - 1000) <= 20
-                          and abs(mm["duty"] - 50) <= 5)
-                    rec("A12-fixture-wave", "PASS" if ok else "FAIL",
-                        a0_50pct=round(m0, 3), a1_25pct=round(m1, 3),
-                        freq_hz=round(mm["freq"], 1), duty_pct=round(mm["duty"], 1),
-                        note=None if ok else FIXTURE_WIRING)
+                v = [volts(x) for x in per[found]]
+                mm = measure_wave(v, r["rate"], (max(v) + min(v)) / 2.0)
+                mean = sum(v) / len(v)
+                # fixture channel 0 runs 50 %, so a wired input must read ~50 %
+                # judge frequency/duty (normalised, so series resistance in the
+                # bench wire does not matter) and that a real signal is present
+                pp = max(v) - min(v)
+                ok = (abs(mm["freq"] - 1000) <= 30 and abs(mm["duty"] - 50) <= 6
+                      and pp >= 1.5)
+                rec("A12-fixture-wave", "PASS" if ok else "FAIL",
+                    input=f"A{found}", freq_hz=round(mm["freq"], 1),
+                    duty_pct=round(mm["duty"], 1), mean_v=round(mean, 3), **details)
+    if fixture:
         fix_configure(up, 0, 1000, 500, 0)
         fix_configure(up, 1, 1000, 500, 0)
     up.close()

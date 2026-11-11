@@ -31,6 +31,9 @@
 #
 # Environment overrides (all optional):
 #   PICO_SDK_PATH   pico-sdk checkout, >= 2.3.0      (default: ~/pico-sdk)
+#   PG_EXCLUDE      channels the fixture must not drive during 'pg test channels',
+#                   e.g. PG_EXCLUDE=11 (GP13, a buzzer on the bench). Leave unset
+#                   for the final production run so every pin is covered.
 #   PICOTOOL_DIR    dir with picotoolConfig.cmake    (default: newest under ~/.pico-sdk/picotool)
 #   PICOTOOL        picotool binary                  (default: from PICOTOOL_DIR or PATH)
 #   OPENOCD         openocd binary                   (default: PATH or ~/.pico-sdk/openocd/*)
@@ -718,6 +721,7 @@ cmd_test() {
     info "${B}Suite: $name${Z}  (tests/hardware/$file)  -> $log"
     local args=(python3 "tests/hardware/$file" --out "tests/hardware/artifacts/$name")
     [ "$name" = channels ] && [ -n "${PG_WIRED:-}" ] && args+=(--wired "$PG_WIRED" --wired-dyn "$PG_WIRED")
+    [ "$name" = channels ] && [ -n "${PG_EXCLUDE:-}" ] && args+=(--exclude "$PG_EXCLUDE")
     set +e
     "${args[@]}" 2>&1 | tee "$log"
     rc=${PIPESTATUS[0]}

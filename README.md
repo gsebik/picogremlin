@@ -258,8 +258,9 @@ can check the analog side of a lab circuit:
   **temperature** sensor;
 - **0–3.3 V only** — these pins are not 5 V tolerant; divide/clamp anything
   larger;
-- 12-bit (0.8 mV) or 8-bit, **500 kS/s total** shared between the enabled
-  inputs (1 channel = 500 kS/s, 3 channels ≈ 166 kS/s each);
+- 12-bit (0.8 mV) or 8-bit, **250 kS/s total** shared between the enabled
+  inputs (1 channel = 250 kS/s, 3 channels ≈ 83 kS/s each; the ADC conversion
+  needs ~192 cycles at 48 MHz, so higher requests are clamped);
 - one-shot captures, gapless streaming and level triggering, driven from the
   host tools ([picogremlin-la](https://github.com/gsebik/picogremlin-la)):
   `la acap`, `la astream`, `la acheck` and the GUI's **analog** tab;
@@ -388,8 +389,8 @@ picogremlin/          ← repo root
   produce a wrong divisor (see `tests/hardware/HARDWARE_VALIDATION.md` §7).
 - **Analog inputs share pins with digital channels 21–23** (GP26–28) and accept
   0–3.3 V only. Analog and digital captures are exclusive, and the ADC's
-  500 kS/s is the *total* across enabled inputs (12-bit streams top out near
-  350 kS/s because of the USB link).
+  250 kS/s is the *total* across enabled inputs (the ADC conversion limit; the
+  12-bit 3-channel stream also fits the ~700 kB/s USB link at that rate).
 - **PIO allocation:** RP2350A PIO0 hosts the LA capture/trigger programs, PIO1 hosts
   SWD and autobaud, and PIO2 hosts the fast LA sampler. The GP0/GP1 jumper is a
   physical trigger link; GP0 drives it and GP1 is sampled as an input.

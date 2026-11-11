@@ -19,7 +19,9 @@ bool processCancel();                    /* LogicAnalyzer.c */
 
 #define PG_ADC_EXT_CHANNELS 3u           /* GP26/27/28 = ADC0/1/2 */
 #define PG_ADC_TEMP_INPUT   4u           /* on-chip temperature sensor */
-#define PG_ADC_MAX_RATE     500000u      /* total conversions per second */
+#define PG_ADC_MAX_RATE     250000u      /* total conversions/s: the conversion
+                                          * needs ~192 cycles at 48 MHz, so >250k
+                                          * requests are clamped here */
 #define PG_ADC_MAX_SAMPLES  100000u      /* interleaved values per one-shot */
 
 static const uint8_t pgAdcPins[PG_ADC_EXT_CHANNELS] = {26u, 27u, 28u};
@@ -39,6 +41,7 @@ static bool     pgAdcHavePrev;
 static uint32_t pgAdcDma;
 static bool     pgAdcBurstOn;
 static bool     pgAdcStreamOn;
+static uint     pgAdcStreamDma;
 
 static uint32_t pgAdcTxVals;             /* interleaved values in the DMA run */
 
@@ -71,9 +74,9 @@ static bool pg_adc_configure(const uint8_t* channels, uint8_t count, uint32_t ra
     uint32_t total = rate * count;
     if (total > PG_ADC_MAX_RATE) total = PG_ADC_MAX_RATE;
     float div = 48000000.0f / (float)total - 1.0f;
-    if (div < 95.0f) div = 0.0f;                        /* 96-cycle minimum period */
+    if (div < 191.0f) div = 191.0f;                     /* 192-cycle minimum period */
     adc_set_clkdiv(div);
-    uint32_t period = (div == 0.0f) ? 96u : (uint32_t)(div + 1.0f);
+    uint32_t period = (uint32_t)(div + 1.0f);
     uint32_t totalActual = 48000000u / period;
 
     adc_fifo_setup(true, true, 1, false, false);
@@ -114,7 +117,14 @@ bool pg_adc_capture_start(uint32_t rate, uint32_t pre, uint32_t post,
     pgAdcHavePrev = false;
     pgAdcTxVals = txVals;
 
-    pgAdcDma = dma_claim_unused_channel(true);
+    int adcChan = dma_claim_unused_channel(false);
+    if (adcChan < 0) return false;              /* no DMA channel: fail cleanly */
+    pgAdcDma = (uint)adcChan;
+    /* the claim does not clear the channel's IRQ state: a previous owner may
+     * have left IRQ0 enabled and its completion latched, which would fire the
+     * next digital capture's handler early (hanging the capture) */
+    dma_channel_set_irq0_enabled(pgAdcDma, false);
+    dma_channel_acknowledge_irq0(pgAdcDma);
     dma_channel_config c = dma_channel_get_default_config(pgAdcDma);
     channel_config_set_read_increment(&c, false);
     channel_config_set_write_increment(&c, true);
@@ -122,6 +132,8 @@ bool pg_adc_capture_start(uint32_t rate, uint32_t pre, uint32_t post,
     channel_config_set_dreq(&c, DREQ_ADC);
     dma_channel_configure(pgAdcDma, &c, captureBuffer, &adc_hw->fifo, txVals, false);
     adc_run(true);
+    sleep_us(200);                              /* let the first conversions settle */
+    while (!adc_fifo_is_empty()) (void)adc_fifo_get();
     dma_channel_start(pgAdcDma);
     pgAdcBurstOn = true;
     return true;
@@ -141,6 +153,8 @@ void pg_adc_capture_abort(void) {
     adc_run(false);
     hw_clear_bits(&dma_hw->ch[pgAdcDma].al1_ctrl, DMA_CH0_CTRL_TRIG_EN_BITS);
     dma_channel_abort(pgAdcDma);
+    dma_channel_set_irq0_enabled(pgAdcDma, false);
+    dma_channel_acknowledge_irq0(pgAdcDma);
     dma_channel_unclaim(pgAdcDma);
     pgAdcBurstOn = false;
     while (!adc_fifo_is_empty()) (void)adc_fifo_get();
@@ -209,6 +223,18 @@ void pg_adc_pack8_inplace(uint8_t* buf, uint32_t values) {
 
 /* ── gapless stream (CMD=0x4A) ───────────────────────────────────────────── */
 
+static void __not_in_flash_func(pg_adc_stream_handler)(void)
+{
+    if (dma_channel_get_irq0_status(pgAdcStreamDma)) {
+        dma_channel_acknowledge_irq0(pgAdcStreamDma);
+        pgStreamReady |= (pgStreamWhich ? 2u : 1u);
+        pgStreamWhich ^= 1u;
+        dma_channel_set_write_addr(pgAdcStreamDma,
+            (void*)(pgStreamBase + (pgStreamWhich ? pgStreamHalfBytes : 0u)), false);
+        dma_channel_set_trans_count(pgAdcStreamDma, pgStreamHalfSamples, true);
+    }
+}
+
 bool pg_adc_stream_start(uint32_t rate, uint32_t halfSamples,
                          const uint8_t* channels, uint8_t count, bool eightBit) {
     if (halfSamples < 16u) halfSamples = 16u;
@@ -224,8 +250,10 @@ bool pg_adc_stream_start(uint32_t rate, uint32_t halfSamples,
     pgStreamReady = 0u;
     memset(captureBuffer, 0, 2u * halfBytes);
 
-    dmaPingPong0 = dma_claim_unused_channel(true);
-    dma_channel_config c = dma_channel_get_default_config(dmaPingPong0);
+    int adcStreamChan = dma_claim_unused_channel(false);
+    if (adcStreamChan < 0) return false;
+    pgAdcStreamDma = (uint)adcStreamChan;
+    dma_channel_config c = dma_channel_get_default_config(pgAdcStreamDma);
     channel_config_set_read_increment(&c, false);
     channel_config_set_write_increment(&c, true);
     channel_config_set_transfer_data_size(&c, DMA_SIZE_16);
@@ -233,14 +261,17 @@ bool pg_adc_stream_start(uint32_t rate, uint32_t halfSamples,
 
     dma_channel_acknowledge_irq0(dmaPingPong0);   /* drop a stale status bit from a
                                                   * previously unclaimed channel */
-    dma_channel_set_irq0_enabled(dmaPingPong0, true);
-    irq_set_exclusive_handler(DMA_IRQ_0, pg_stream_dma_handler);
+    dma_channel_acknowledge_irq0(pgAdcStreamDma);   /* drop a stale status */
+    dma_channel_set_irq0_enabled(pgAdcStreamDma, true);
+    irq_set_exclusive_handler(DMA_IRQ_0, pg_adc_stream_handler);
     irq_set_enabled(DMA_IRQ_0, true);
 
-    dma_channel_configure(dmaPingPong0, &c, pgStreamBase, &adc_hw->fifo,
+    dma_channel_configure(pgAdcStreamDma, &c, pgStreamBase, &adc_hw->fifo,
                           halfSamples, false);
     adc_run(true);
-    dma_channel_start(dmaPingPong0);
+    sleep_us(200);                              /* drop the settling conversions */
+    while (!adc_fifo_is_empty()) (void)adc_fifo_get();
+    dma_channel_start(pgAdcStreamDma);
     pgAdcStreamOn = true;
     return true;
 }
@@ -248,12 +279,13 @@ bool pg_adc_stream_start(uint32_t rate, uint32_t halfSamples,
 void pg_adc_stream_stop(void) {
     adc_run(false);
     if (!pgAdcStreamOn) return;
-    hw_clear_bits(&dma_hw->ch[dmaPingPong0].al1_ctrl, DMA_CH0_CTRL_TRIG_EN_BITS);
-    dma_channel_abort(dmaPingPong0);
-    dma_channel_set_irq0_enabled(dmaPingPong0, false);
+    hw_clear_bits(&dma_hw->ch[pgAdcStreamDma].al1_ctrl, DMA_CH0_CTRL_TRIG_EN_BITS);
+    dma_channel_abort(pgAdcStreamDma);
+    dma_channel_set_irq0_enabled(pgAdcStreamDma, false);
+    dma_channel_acknowledge_irq0(pgAdcStreamDma);
     irq_set_enabled(DMA_IRQ_0, false);
-    irq_remove_handler(DMA_IRQ_0, pg_stream_dma_handler);
-    dma_channel_unclaim(dmaPingPong0);
+    irq_remove_handler(DMA_IRQ_0, pg_adc_stream_handler);
+    dma_channel_unclaim(pgAdcStreamDma);
     while (!adc_fifo_is_empty()) (void)adc_fifo_get();
     pgStreamReady = 0u;
     pgAdcStreamOn = false;

@@ -284,11 +284,11 @@ UART 104/105 (unchanged), descriptor metadata corrected.
 ## 15. Analog capture (firmware picogremlin-1.1) — 11/11 PASS, 1 NOT TESTED
 
 Board `93E145BEC49B83B2`, firmware `picogremlin-1.1` (ADC support; PG_INFO
-advertises `ANALOG:3,500000,1`), suite `tests/hardware/tests_la_analog.py`:
+advertises `ANALOG:3,250000,1`), suite `tests/hardware/tests_la_analog.py`:
 
 | check | result |
 |---|---|
-| A1 capability line | PASS (`ANALOG:3,500000,1`) |
+| A1 capability line | PASS (`ANALOG:3,250000,1`) |
 | A2 temperature 12-bit | PASS (≈35 °C, spread < 5 °C) |
 | A3 8-bit mode | PASS (voltage channel within 32 counts, temp within 10 °C) |
 | A4 channel interleaving | PASS (A0 alone == A0 in a 2-channel capture) |
@@ -315,6 +315,39 @@ Notes for 1.1:
   suites (la 12/12, stream 6/6, continuous 16/16, edge 5/5, bridge 3/3,
   measure 22/22, range 7/7) pass on the same firmware.
 
-## 16. How to reproduce
+## 16. Firmware 1.1 fixes and re-validation (2026-11-11)
+
+Three bugs were found while adding and using the analog capture, all fixed:
+
+1. **ADC rate ceiling** — a conversion needs ~192 cycles at 48 MHz, so requests
+   above 250 kS/s ran at half speed. The firmware now clamps to 250 kS/s and
+   reports the achieved per-channel rate (`ANALOG:3,250000,1`).
+2. **DMA IRQ state leak** — an analog capture could leave a latched IRQ on a
+   channel previously used by a digital capture, so the *next* digital capture
+   never completed (the probe answered the identity but not captures; a reflash
+   was needed). Claim/release now clear the channel's IRQ state; analog and
+   digital captures alternate cleanly.
+3. **Stale first conversion** — the first ADC conversions after a (re)configure
+   were unsettled (the temperature channel read up to 96 °C for one sample).
+   They are discarded before the DMA starts.
+
+Also hardened: the analog paths no longer panic when no DMA channel is free
+(they answer `ANALOG_ERROR`), and the analog stream uses its own DMA channel
+instead of the digital capture's shared global.
+
+Re-validated on this build (board `93E145BEC49B83B2`, target running a lab
+program, so the fixture-dependent suites were not re-run):
+
+| suite | result |
+|---|---|
+| compat (stock protocol) | 12/12 PASS |
+| analog (A1–A11) | 12 checks, 1 NOT TESTED (A12 needs the fixture PWM) |
+| bridge | 3/3 PASS |
+
+Fixture-dependent suites (channels, stream, continuous, edge, measure, range,
+`la`) were last validated on the 1.1 build *before* these fixes; they need the
+HIL fixture flashed on the target (`./pg fixture-flash`) to re-run.
+
+## 17. How to reproduce
 
 See `tests/hardware/README.md` and the test scripts in `tests/hardware/`.

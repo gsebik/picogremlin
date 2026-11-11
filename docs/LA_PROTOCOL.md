@@ -101,7 +101,7 @@ the pins through PIO).
 `PG_INFO` (0x40) advertises the feature when the firmware supports it:
 
 ```
-ANALOG:<external channels>,<max conversions/s>,<temp:0|1>     e.g. ANALOG:3,500000,1
+ANALOG:<external channels>,<max conversions/s>,<temp:0|1>     e.g. ANALOG:3,250000,1
 ```
 
 Conversions:
@@ -113,7 +113,9 @@ temp_C = 27 - (volts - 0.706) / 0.001721        (temperature input)
 
 Samples are **interleaved**: value `i` belongs to `channels[i % channelCount]`,
 and the per-channel rate is `totalRate / channelCount`. The ADC free-runs at
-48 MHz / 96 cycles = **500 kS/s total** (round-robin over the enabled inputs).
+48 MHz and a conversion needs ~192 cycles, so the total is **250 kS/s**
+(round-robin over the enabled inputs); higher requests are clamped and the
+achieved per-channel rate is reported in the reply.
 
 ### 0x49 ANALOG_CAPTURE (one-shot)
 

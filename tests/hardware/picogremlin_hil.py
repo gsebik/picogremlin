@@ -122,6 +122,7 @@ FIX_CMD_BAUD = b"B"
 FIX_CMD_BURST = b"T"
 FIX_CMD_DEFAULT = b"Z"
 FIX_CMD_MASK = b"M"
+FIX_CMD_EXCLUDE = b"N"
 FIX_CMD_WALK = b"K"
 FIX_CMD_COMB = b"F"
 FIX_CMD_GEN_CH = b"G"
@@ -283,6 +284,25 @@ class SerialPort:
         os.close(self.fd)
 
 
+def drain_quiet(port, quiet=0.15, max_time=2.0):
+    """Read and discard until the link has been silent for `quiet` seconds."""
+    deadline = time.monotonic() + max_time
+    while time.monotonic() < deadline:
+        if not port.read(65536, timeout=quiet):
+            return
+
+
+def la_recover(port):
+    """Put the LA back into the command parser: stop any stream, cancel any
+    capture, then drain until quiet. Makes a suite self-healing after an
+    aborted read (a crashed test can leave the CDC buffers full of data)."""
+    for _ in range(2):
+        port.write(LA_FRAME_START + bytes([0x42]) + LA_FRAME_END)
+        port.write(b"\xff")
+    port.flush()
+    drain_quiet(port, quiet=0.15, max_time=2.0)
+
+
 def find_ports():
     """Return (uart_path, la_path) for the PicoGremlin.
 
@@ -347,7 +367,7 @@ def la_capture(port, channels, frequency, pre, post, trigger_type=0,
     (it is dropped when la_bridge_connected() is momentarily false), so the
     parser tolerates both cases.
     """
-    port.drain(drain)
+    drain_quiet(port, quiet=0.15, max_time=max(0.5, drain))
     mode = 2 if max(channels) >= 16 else (1 if max(channels) >= 8 else 0)
     req = la_build_capture_request(trigger_type, trigger, inverted,
                                    trigger_value, channels, frequency,
@@ -391,6 +411,9 @@ def la_capture(port, channels, frequency, pre, post, trigger_type=0,
                 "got": len(head) - 4, "want": total}
     samples_raw = head[4:4 + count * width]
     idx = 4 + count * width
+    if idx >= len(head) or head[idx] > 64 or idx + 1 + head[idx] * 4 > len(head):
+        la_recover(port)
+        return {"ok": False, "response": "desynced capture payload (recovered)"}
     stamp_len = head[idx]
     timestamps = []
     idx += 1
@@ -568,6 +591,12 @@ def fix_stop_stream(port, timeout=2):
 def fix_mask(port, mask, timeout=2):
     """Drive all 24 LA pins to `mask` (bit k = channel k) as SIO outputs."""
     fix_send(port, FIX_CMD_MASK, struct.pack("<I", mask))
+    return port.read(1, timeout=timeout) == b"K"
+
+
+def fix_exclude(port, mask, timeout=2):
+    """Channels the target fixture must never drive (bit k = channel k)."""
+    fix_send(port, FIX_CMD_EXCLUDE, struct.pack("<I", mask))
     return port.read(1, timeout=timeout) == b"K"
 
 

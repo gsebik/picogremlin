@@ -97,6 +97,7 @@ static absolute_time_t comb_start;
 static uint32_t comb_last[24];
 static bool walk_active;
 static uint32_t walk_toggle, walk_static, walk_hz;
+static uint32_t exclude_mask;      /* channels never driven (bit k = channel k) */
 static uint64_t walk_start_us;
 static bool heart_en = true;            /* GP22 heartbeat gate */
 
@@ -373,7 +374,9 @@ static void engine_claim_outputs(void)
 {
     for (int k = 0; k < 24; k++) {
         gpio_init(ch_gpio[k]);
-        gpio_set_dir(ch_gpio[k], GPIO_OUT);
+        /* an excluded channel (e.g. a buzzer on the bench) stays an input, so
+         * no signal mode can ever drive it */
+        gpio_set_dir(ch_gpio[k], (exclude_mask & (1u << k)) ? GPIO_IN : GPIO_OUT);
     }
 }
 
@@ -382,7 +385,7 @@ static void signal_set_static(uint32_t mask)
     engine_stop();
     heart_en = false;
     engine_claim_outputs();
-    gpio_put_masked(all_pin_mask(), channels_to_gpio(mask));
+    gpio_put_masked(all_pin_mask(), channels_to_gpio(mask & ~exclude_mask));
 }
 
 static void signal_set_inputs(uint8_t pull)
@@ -430,6 +433,7 @@ static void engine_service(void)
     if (comb_active) {
         uint32_t us = (uint32_t)absolute_time_diff_us(comb_start, get_absolute_time());
         for (int k = 0; k < 24; k++) {
+            if (exclude_mask & (1u << k)) continue;
             uint64_t half_period = (500000ULL * (k + 1)) / comb_base;
             if (half_period == 0) continue;
             uint32_t want = (uint32_t)(us / half_period);
@@ -443,7 +447,8 @@ static void engine_service(void)
         uint64_t us = (uint64_t)to_us_since_boot(get_absolute_time()) - walk_start_us;
         uint64_t period = 1000000ULL / walk_hz;
         bool level = (us % period) < (period / 2u);
-        uint32_t chstate = (level ? walk_toggle : 0u) | (walk_static & ~walk_toggle);
+        uint32_t chstate = ((level ? walk_toggle : 0u) | (walk_static & ~walk_toggle))
+                           & ~exclude_mask;
         gpio_put_masked(all_pin_mask(), channels_to_gpio(chstate));
     }
 }
@@ -602,7 +607,8 @@ static void handle_command(uint8_t cmd)
     case 'G': {  /* G ch_a(1) ch_b(1) -> retarget precision generator pair */
         uint8_t a = uart_getc_wait();
         uint8_t b = uart_getc_wait();
-        if (a > 23 || b > 23 || a == b) { uart_put_byte('!'); break; }
+        if (a > 23 || b > 23 || a == b ||
+            (exclude_mask & ((1u << a) | (1u << b)))) { uart_put_byte('!'); break; }
         comb_active = false; walk_active = false;
         int old_a = g_gen_a_gpio, old_b = g_gen_b_gpio;
         g_gen_a_gpio = ch_gpio[a];
@@ -611,6 +617,16 @@ static void handle_command(uint8_t cmd)
         g_fast_mode = false;
         gpio_init(old_a); gpio_init(old_b);     /* release to high-Z input */
         apply_signal_config();
+        uart_put_byte('K');
+        break;
+    }
+
+    case 'N': {  /* N mask(4) -> channels that must never be driven (bit k = ch k) */
+        uint32_t mask = uart_get_u32le_wait();
+        exclude_mask = mask & 0xFFFFFFu;
+        /* any channel that just became excluded is released to an input */
+        for (int k = 0; k < 24; k++)
+            if (exclude_mask & (1u << k)) gpio_set_dir(ch_gpio[k], GPIO_IN);
         uart_put_byte('K');
         break;
     }
